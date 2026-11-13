@@ -1,0 +1,6 @@
+{
+  "name": "US 5-Year Quality Moat Investment Research Engine",
+  "description": "Institutional-grade 2-year quality moat research engine and terminal for US equities, featuring live multi-source web news integration (WSJ, Bloomberg, Reuters), portfolio risk alerts, SEC financial data, 6-category weighted scoring, value trap detection, and pre-market intelligence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

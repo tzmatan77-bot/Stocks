@@ -1,0 +1,92 @@
+[
+  {
+    "id": "pos-sofi",
+    "ticker": "SOFI",
+    "companyName": "SoFi Technologies, Inc.",
+    "shares": 20,
+    "buyPrice": 16.00,
+    "actionFee": 14.50,
+    "purchaseDate": "2026-08-01",
+    "notes": "2 מנות ($7.50+$7.00) - בנקאות דיגיטלית ופינטק"
+  },
+  {
+    "id": "pos-bkng",
+    "ticker": "BKNG",
+    "companyName": "Booking Holdings Inc.",
+    "shares": 2,
+    "buyPrice": 172.86,
+    "actionFee": 7.00,
+    "purchaseDate": "2026-08-05",
+    "notes": "פלטפורמת נסיעות ומלונות גלובלית"
+  },
+  {
+    "id": "pos-abbv",
+    "ticker": "ABBV",
+    "companyName": "AbbVie Inc.",
+    "shares": 2,
+    "buyPrice": 262.00,
+    "actionFee": 7.00,
+    "purchaseDate": "2026-08-10",
+    "notes": "ביופארמה, אימונולוגיה ודיבידנד צומח"
+  },
+  {
+    "id": "pos-ko",
+    "ticker": "KO",
+    "companyName": "The Coca-Cola Company",
+    "shares": 3,
+    "buyPrice": 87.89,
+    "actionFee": 7.00,
+    "purchaseDate": "2026-08-12",
+    "notes": "עוגן צריכה בסיסית הגנתי ותשואת דיבידנד"
+  },
+  {
+    "id": "pos-nvda",
+    "ticker": "NVDA",
+    "companyName": "NVIDIA Corporation",
+    "shares": 7,
+    "buyPrice": 223.31,
+    "actionFee": 21.00,
+    "purchaseDate": "2026-07-20",
+    "notes": "3 מנות (DCA) - מונופול חומרת AI ומאיצים"
+  },
+  {
+    "id": "pos-amzn",
+    "ticker": "AMZN",
+    "companyName": "Amazon.com, Inc.",
+    "shares": 7,
+    "buyPrice": 239.69,
+    "actionFee": 14.00,
+    "purchaseDate": "2026-07-15",
+    "notes": "3 מנות (DCA) - מסחר וענן AWS"
+  },
+  {
+    "id": "pos-uber",
+    "ticker": "UBER",
+    "companyName": "Uber Technologies, Inc.",
+    "shares": 6,
+    "buyPrice": 72.72,
+    "actionFee": 14.00,
+    "purchaseDate": "2026-08-15",
+    "notes": "2 מנות (DCA). ציון איכות: 89/100"
+  },
+  {
+    "id": "pos-googl",
+    "ticker": "GOOGL",
+    "companyName": "Alphabet Inc.",
+    "shares": 6,
+    "buyPrice": 343.68,
+    "actionFee": 29.50,
+    "purchaseDate": "2026-07-01",
+    "notes": "4 מנות (DCA). ציון איכות: 93/100"
+  },
+  {
+    "id": "pos-now",
+    "ticker": "NOW",
+    "companyName": "ServiceNow, Inc.",
+    "shares": 2,
+    "buyPrice": 137.26,
+    "actionFee": 7.50,
+    "purchaseDate": "2026-08-20",
+    "notes": "פוזיציית איכות לשנתיים (FY2). ציון מודל: 90/100"
+  }
+]
