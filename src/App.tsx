@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { ResearchStock, UniverseAnalysisResult, PortfolioPosition, WatchlistItem } from './types';
+import { ResearchStock, UniverseAnalysisResult, PortfolioPosition, WatchlistItem, NamedWatchlist } from './types';
 import { FULL_UNIVERSE_RESULT, TOP_20_SUMMARY_LIST } from './data/universeData';
 import { FULL_TOP_20_COMPOUNDERS } from './data/extendedUniverse';
 import { MARKET_UNIVERSE_CATALOG } from './data/marketUniverseData';
@@ -31,9 +31,10 @@ import { CompetitiveMapViewer } from './components/CompetitiveMapViewer';
 import { ThesisIntelligenceCenter } from './components/ThesisIntelligenceCenter';
 import { InstitutionalToolsHub } from './components/InstitutionalToolsHub';
 import { PremarketNewsIntelligence } from './components/PremarketNewsIntelligence';
+import { ExtendedHoursTracker } from './components/ExtendedHoursTracker';
 import { RightSidebarNav } from './components/RightSidebarNav';
 import { SupportedLanguage, SUPPORTED_LANGUAGES, translations } from './i18n';
-import { Activity, RefreshCw, Play, Pause, Zap } from 'lucide-react';
+import { RefreshCw, Menu } from 'lucide-react';
 
 const INITIAL_WATCHLIST: WatchlistItem[] = [
   {
@@ -107,6 +108,7 @@ export default function App() {
     return 4;
   });
 
+  const [isMobileNavOpen, setIsMobileNavOpen] = useState<boolean>(false);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState<boolean>(() => {
     try {
       return localStorage.getItem('MOATGUARD_SIDEBAR_COLLAPSED_V1') === 'true';
@@ -138,18 +140,52 @@ export default function App() {
     return 'he';
   });
 
-  const [watchlist, setWatchlist] = useState<WatchlistItem[]>(() => {
+  const t = translations[currentLang] || translations.en;
+
+  const [watchlists, setWatchlists] = useState<NamedWatchlist[]>(() => {
     try {
-      const saved = localStorage.getItem('INSTITUTIONAL_WATCHLIST_DATA_V1');
-      if (saved !== null) {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
+      const savedV2 = localStorage.getItem('MOATGUARD_WATCHLISTS_V2');
+      if (savedV2 !== null) {
+        const parsed = JSON.parse(savedV2);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
       }
+      const legacySaved = localStorage.getItem('INSTITUTIONAL_WATCHLIST_DATA_V1');
+      let initialItems = INITIAL_WATCHLIST;
+      if (legacySaved !== null) {
+        const parsedLegacy = JSON.parse(legacySaved);
+        if (Array.isArray(parsedLegacy)) initialItems = parsedLegacy;
+      }
+      return [
+        {
+          id: 'default',
+          name: 'רשימת מעקב ראשית',
+          createdAt: new Date().toISOString().slice(0, 10),
+          items: initialItems,
+        },
+      ];
     } catch (e) {
       console.warn('Using default watchlist', e);
+      return [
+        {
+          id: 'default',
+          name: 'רשימת מעקב ראשית',
+          createdAt: new Date().toISOString().slice(0, 10),
+          items: INITIAL_WATCHLIST,
+        },
+      ];
     }
-    return INITIAL_WATCHLIST;
   });
+
+  const [activeWatchlistId, setActiveWatchlistId] = useState<string>(() => {
+    try {
+      return localStorage.getItem('MOATGUARD_ACTIVE_WATCHLIST_V2') || 'default';
+    } catch {
+      return 'default';
+    }
+  });
+
+  const activeWatchlist = watchlists.find((w) => w.id === activeWatchlistId) || watchlists[0];
+  const watchlist: WatchlistItem[] = activeWatchlist ? activeWatchlist.items : [];
 
   // Listen to portfolio updates from other tabs or modals to keep counters in sync
   useEffect(() => {
@@ -238,20 +274,21 @@ export default function App() {
     }
   }, [currentLang]);
 
-  // Save watchlist to LocalStorage
+  // Save watchlists to LocalStorage
   useEffect(() => {
     try {
-      localStorage.setItem('INSTITUTIONAL_WATCHLIST_DATA_V1', JSON.stringify(watchlist));
+      localStorage.setItem('MOATGUARD_WATCHLISTS_V2', JSON.stringify(watchlists));
+      localStorage.setItem('MOATGUARD_ACTIVE_WATCHLIST_V2', activeWatchlistId);
     } catch (e) {
-      console.warn('Failed to save watchlist', e);
+      console.warn('Failed to save watchlists', e);
     }
-  }, [watchlist]);
+  }, [watchlists, activeWatchlistId]);
 
   // Keep stable refs to avoid re-triggering quotes callbacks and effects
   const stocksRef = useRef(stocks);
   stocksRef.current = stocks;
-  const watchlistRef = useRef(watchlist);
-  watchlistRef.current = watchlist;
+  const watchlistsRef = useRef(watchlists);
+  watchlistsRef.current = watchlists;
   const selectedStockRef = useRef(selectedStockForDeepDive);
   selectedStockRef.current = selectedStockForDeepDive;
   const extraMonitoredTickersRef = useRef<Set<string>>(new Set(['AFL', 'A', 'APD', 'ABT', 'ABBV', 'ACN', 'ADBE', 'AMD']));
@@ -270,9 +307,11 @@ export default function App() {
         if (s?.ticker) tickerSet.add(s.ticker.toUpperCase().trim());
       });
 
-      // 2. Watchlist tickers
-      watchlistRef.current.forEach((w) => {
-        if (w?.ticker) tickerSet.add(w.ticker.toUpperCase().trim());
+      // 2. All Watchlist tickers across all user-created watchlists
+      watchlistsRef.current.forEach((wl) => {
+        wl.items.forEach((w) => {
+          if (w?.ticker) tickerSet.add(w.ticker.toUpperCase().trim());
+        });
       });
 
       // 3. User personal portfolio tickers from localStorage
@@ -595,14 +634,17 @@ export default function App() {
     setActiveTab('top5');
   };
 
-  // Watchlist Actions
+  // Multi-Watchlist Actions (Unlimited Lists & Unlimited Stocks)
   const handleToggleWatchlist = (stock: ResearchStock) => {
-    setWatchlist((prev) => {
-      const exists = prev.some((w) => w.ticker === stock.ticker);
-      if (exists) {
-        return prev.filter((w) => w.ticker !== stock.ticker);
-      } else {
-        const currentP = livePrices[stock.ticker]?.price || parseFloat(stock.currentPrice.replace(/[^0-9.]/g, '')) || 100;
+    setWatchlists((prev) =>
+      prev.map((wl) => {
+        if (wl.id !== (activeWatchlist?.id || wl.id)) return wl;
+        const exists = wl.items.some((w) => w.ticker === stock.ticker);
+        if (exists) {
+          return { ...wl, items: wl.items.filter((w) => w.ticker !== stock.ticker) };
+        }
+        const currentP =
+          livePrices[stock.ticker]?.price || parseFloat(stock.currentPrice.replace(/[^0-9.]/g, '')) || 100;
         const newItem: WatchlistItem = {
           ticker: stock.ticker,
           companyName: stock.companyName,
@@ -610,22 +652,63 @@ export default function App() {
           targetBuyPrice: Number((currentP * 0.9).toFixed(2)),
           targetPE: 22,
           alertOnThesisBreak: true,
-          notes: stock.whyInTopUniverse || 'High-quality 5Y compounder candidate'
+          notes: stock.whyInTopUniverse || 'High-quality 5Y compounder candidate',
         };
-        return [newItem, ...prev];
+        return { ...wl, items: [newItem, ...wl.items] };
+      })
+    );
+  };
+
+  const handleUpdateWatchlistItem = (item: WatchlistItem, targetListId?: string) => {
+    const destId = targetListId || activeWatchlist?.id || 'default';
+    setWatchlists((prev) =>
+      prev.map((wl) => {
+        if (wl.id !== destId) return wl;
+        const filtered = wl.items.filter((w) => w.ticker !== item.ticker);
+        return { ...wl, items: [item, ...filtered] };
+      })
+    );
+  };
+
+  const handleRemoveFromWatchlist = (ticker: string, targetListId?: string) => {
+    const destId = targetListId || activeWatchlist?.id;
+    setWatchlists((prev) =>
+      prev.map((wl) => {
+        if (destId && wl.id !== destId) return wl;
+        return { ...wl, items: wl.items.filter((w) => w.ticker !== ticker) };
+      })
+    );
+  };
+
+  const handleCreateWatchlist = (name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const newId = `wl-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const newList: NamedWatchlist = {
+      id: newId,
+      name: trimmed,
+      createdAt: new Date().toISOString().slice(0, 10),
+      items: [],
+    };
+    setWatchlists((prev) => [...prev, newList]);
+    setActiveWatchlistId(newId);
+  };
+
+  const handleRenameWatchlist = (id: string, name: string) => {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setWatchlists((prev) => prev.map((wl) => (wl.id === id ? { ...wl, name: trimmed } : wl)));
+  };
+
+  const handleDeleteWatchlist = (id: string) => {
+    setWatchlists((prev) => {
+      if (prev.length <= 1) return prev;
+      const next = prev.filter((wl) => wl.id !== id);
+      if (activeWatchlistId === id && next[0]) {
+        setActiveWatchlistId(next[0].id);
       }
+      return next;
     });
-  };
-
-  const handleUpdateWatchlistItem = (item: WatchlistItem) => {
-    setWatchlist((prev) => {
-      const filtered = prev.filter((w) => w.ticker !== item.ticker);
-      return [item, ...filtered];
-    });
-  };
-
-  const handleRemoveFromWatchlist = (ticker: string) => {
-    setWatchlist((prev) => prev.filter((w) => w.ticker !== ticker));
   };
 
   // Direct quick add to portfolio modal
@@ -690,11 +773,37 @@ export default function App() {
   };
 
   const top5List = stocks.slice(0, 5);
-  const t = translations[currentLang] || translations.en;
+  const pageTitleMap: Record<string, { he: string; en: string }> = {
+    home: { he: 'סקירה ראשית', en: 'Overview' },
+    premarket_session: { he: 'טרום-מסחר לייב (Pre-Market)', en: 'Live Pre-Market Trading' },
+    afterhours_session: { he: 'מסחר לאחר סגירה לייב (After-Hours)', en: 'Live After-Hours Trading' },
+    premarket: { he: 'חדשות יומיות וניתוח תגובה', en: 'Daily News & Reaction Analysis' },
+    top10: { he: 'גלאי מניות השוק', en: 'Market Screener' },
+    portfolio: { he: 'תיק אישי', en: 'Personal Portfolio' },
+    watchlist: { he: 'רשימת מעקב', en: 'Watchlist' },
+    top5: { he: 'מחקר מעמיק', en: 'Deep Dive Research' },
+    analyzer: { he: 'אנליסט AI', en: 'AI Analyst' },
+    earnings: { he: 'יומן דוחות כספיים', en: 'Earnings Calendar' },
+    toolshub: { he: 'כל הכלים המוסדיים', en: 'Institutional Tools' },
+    dcf: { he: 'מודל שווי הוגן (DCF)', en: 'DCF Valuation' },
+    reversedcf: { he: 'Reverse DCF', en: 'Reverse DCF' },
+    simulator: { he: 'סימולטור תיק השקעות', en: 'Portfolio Simulator' },
+    yield: { he: 'תשואת בעלי מניות', en: 'Shareholder Yield' },
+    compmap: { he: 'מפת חפיר תחרותית', en: 'Competitive Map' },
+    thesismonitor: { he: 'בקרת תזה ויומן', en: 'Thesis Monitor' },
+    quarterly: { he: 'דוחות רבעוניים וניתוח SEC', en: 'Quarterly Reports & Analysis' },
+    macro: { he: 'מבחן לחץ מאקרו', en: 'Macro Stress Test' },
+    terminal: { he: 'מסוף מחקר', en: 'Market Terminal' },
+    print: { he: 'מזכר השקעה להדפסה', en: 'Investment Memo' },
+    compare: { he: 'השוואת מניות', en: 'Stock Comparison' },
+    top20: { he: 'טבלת איכות Top 20', en: 'Top 20 Matrix' },
+    rules: { he: 'מתודולוגיית המחקר', en: 'Methodology' },
+  };
+  const currentPageTitle = pageTitleMap[activeTab]?.[currentLang === 'he' ? 'he' : 'en'] || (currentLang === 'he' ? 'סקירה ראשית' : 'Overview');
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-cyan-500 selection:text-black">
-      {/* Right Sidebar Navigation */}
+    <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-cyan-500/30 selection:text-cyan-200">
+      {/* Navigation Sidebar (Desktop Fixed + Mobile Drawer) */}
       <RightSidebarNav
         activeTab={activeTab}
         setActiveTab={setActiveTab}
@@ -713,71 +822,50 @@ export default function App() {
         onLanguageChange={handleLanguageChange}
         isCollapsed={isSidebarCollapsed}
         onToggleCollapse={handleToggleCollapse}
+        isMobileOpen={isMobileNavOpen}
+        onCloseMobile={() => setIsMobileNavOpen(false)}
       />
 
-      {/* Mobile Top Header (screen < md) */}
-      <div className="md:hidden border-b border-slate-800 bg-slate-900/95 backdrop-blur sticky top-0 z-30 px-4 py-2.5 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span className="font-extrabold text-sm text-white">MoatGuard <span className="text-cyan-400">PRO</span></span>
-          <span className="text-[9px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-mono">5Y</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-400 font-mono flex items-center gap-1">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-            <span>LIVE</span>
-          </span>
-        </div>
-      </div>
-
-      {/* Main Content Area: permanently offset to accommodate right sidebar on desktop */}
+      {/* Main Content Area: accommodates sidebar width cleanly in both RTL and LTR */}
       <div
-        className={`transition-all duration-300 ${
+        className={`transition-all duration-200 ${
           isSidebarCollapsed
-            ? 'mr-0 md:mr-16 rtl:mr-0 rtl:md:mr-16'
-            : 'mr-0 md:mr-72 rtl:mr-0 rtl:md:mr-72'
+            ? 'rtl:md:mr-16 ltr:md:ml-16'
+            : 'rtl:md:mr-64 ltr:md:ml-64'
         }`}
       >
-        {/* Global Auto-Update & Live Sync Header Bar */}
-        <header className="border-b border-slate-800/80 bg-slate-900/70 backdrop-blur sticky top-0 z-20 px-4 sm:px-6 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs font-mono shadow-sm">
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2">
-              <span className={`w-2.5 h-2.5 rounded-full ${isLiveStreaming ? 'bg-emerald-400 animate-pulse ring-2 ring-emerald-500/20' : 'bg-amber-400'}`} />
-              <span className={`font-bold ${isLiveStreaming ? 'text-emerald-400' : 'text-amber-400'}`}>
-                {isLiveStreaming
-                  ? (currentLang === 'he' ? 'סנכרון שוק אוטומטי פעיל (כל 10 שנ\')' : 'Live Auto Market Sync Active (Every 10s)')
-                  : (currentLang === 'he' ? 'סנכרון שוק אוטומטי מושהה' : 'Auto Sync Paused')}
+        {/* Clean Top Context Header Bar */}
+        <header className="h-14 border-b border-slate-800/80 bg-slate-950/90 backdrop-blur sticky top-0 z-20 px-4 sm:px-6 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <button
+              type="button"
+              onClick={() => setIsMobileNavOpen(true)}
+              className="md:hidden p-2 rounded-lg text-slate-300 hover:text-white hover:bg-slate-800 transition cursor-pointer shrink-0"
+              aria-label={currentLang === 'he' ? 'פתח תפריט' : 'Open menu'}
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+
+            <div className="flex items-center gap-2 text-sm min-w-0">
+              <span className="font-bold text-white truncate">{currentPageTitle}</span>
+              <span className="hidden sm:inline text-slate-600">·</span>
+              <span className="hidden sm:inline text-xs text-slate-400 font-mono truncate">
+                {currentLang === 'he'
+                  ? `עודכן ${new Date(lastQuotesSyncTime).toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' })}`
+                  : `Synced ${new Date(lastQuotesSyncTime).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`}
               </span>
             </div>
-            <span className="text-slate-600 hidden sm:inline">•</span>
-            <span className="text-slate-400 text-[11px] hidden sm:inline">
-              {currentLang === 'he'
-                ? `סנכרון אחרון: לפני ${secondsSinceLastSync} שניות (${new Date(lastQuotesSyncTime).toLocaleTimeString('he-IL')})`
-                : `Last sync: ${secondsSinceLastSync}s ago (${new Date(lastQuotesSyncTime).toLocaleTimeString('en-US')})`}
-            </span>
           </div>
 
-          <div className="flex items-center gap-2.5">
-            {isSyncingQuotes && (
-              <span className="text-cyan-400 flex items-center gap-1.5 animate-pulse text-[11px] bg-cyan-950/60 px-2 py-0.5 rounded border border-cyan-800/50">
-                <RefreshCw className="w-3 h-3 animate-spin" />
-                <span>{currentLang === 'he' ? 'מרענן מחירים מוול סטריט...' : 'Syncing Wall Street quotes...'}</span>
-              </span>
-            )}
+          <div className="flex items-center gap-2 shrink-0">
             <button
-              onClick={() => setIsLiveStreaming((prev) => !prev)}
-              className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition flex items-center gap-1.5 cursor-pointer border border-slate-700/60"
-              title={isLiveStreaming ? 'השהה סנכרון שוק אוטומטי' : 'הפעל סנכרון שוק אוטומטי'}
-            >
-              {isLiveStreaming ? <Pause className="w-3 h-3 text-amber-400" /> : <Play className="w-3 h-3 text-emerald-400" />}
-              <span className="text-[11px] font-medium">{isLiveStreaming ? (currentLang === 'he' ? 'השהה' : 'Pause') : (currentLang === 'he' ? 'המשך' : 'Resume')}</span>
-            </button>
-            <button
+              type="button"
               onClick={handleManualRefreshPrices}
               disabled={isSyncingQuotes}
-              className="px-3 py-1 rounded-lg bg-cyan-950 hover:bg-cyan-900 border border-cyan-700/80 text-cyan-300 transition flex items-center gap-1.5 cursor-pointer shadow-sm active:scale-95 disabled:opacity-50"
+              className="px-3 py-1.5 rounded-lg bg-slate-900 hover:bg-slate-800 border border-slate-700/80 text-slate-200 text-xs font-medium transition flex items-center gap-1.5 cursor-pointer disabled:opacity-50 whitespace-nowrap"
             >
-              <RefreshCw className={`w-3 h-3 ${isSyncingQuotes ? 'animate-spin' : ''}`} />
-              <span className="text-[11px] font-bold">{currentLang === 'he' ? 'סנכרן עכשיו' : 'Sync Now'}</span>
+              <RefreshCw className={`w-3.5 h-3.5 text-cyan-400 ${isSyncingQuotes ? 'animate-spin' : ''}`} />
+              <span>{isSyncingQuotes ? (currentLang === 'he' ? 'מסנכרן...' : 'Syncing...') : (currentLang === 'he' ? 'רענן מחירים' : 'Refresh Prices')}</span>
             </button>
           </div>
         </header>
@@ -804,6 +892,38 @@ export default function App() {
         {/* Main Container for Tool Tabs */}
         {activeTab !== 'home' && (
           <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 sm:py-8 space-y-6 animate-fadeIn">
+          {/* Tab: Live Pre-Market Session */}
+          {activeTab === 'premarket_session' && (
+            <ExtendedHoursTracker
+              session="PRE"
+              stocks={stocks}
+              watchlist={watchlist}
+              watchlists={watchlists}
+              onToggleWatchlist={handleToggleWatchlist}
+              onAddToPortfolio={handleQuickAddToPortfolio}
+              onSelectStock={(stk) => setSelectedStockForModal(stk)}
+              onOpenDeepDive={handleOpenDeepDive}
+              onSwitchSessionTab={(tabId) => setActiveTab(tabId)}
+              currentLang={currentLang}
+            />
+          )}
+
+          {/* Tab: Live After-Hours Session */}
+          {activeTab === 'afterhours_session' && (
+            <ExtendedHoursTracker
+              session="POST"
+              stocks={stocks}
+              watchlist={watchlist}
+              watchlists={watchlists}
+              onToggleWatchlist={handleToggleWatchlist}
+              onAddToPortfolio={handleQuickAddToPortfolio}
+              onSelectStock={(stk) => setSelectedStockForModal(stk)}
+              onOpenDeepDive={handleOpenDeepDive}
+              onSwitchSessionTab={(tabId) => setActiveTab(tabId)}
+              currentLang={currentLang}
+            />
+          )}
+
           {/* Tab: Pre-Market Daily Intelligence & Opening Bell Recommendations */}
           {activeTab === 'premarket' && (
             <PremarketNewsIntelligence
@@ -939,12 +1059,19 @@ export default function App() {
           <WatchlistManager
             stocks={stocks}
             watchlist={watchlist}
+            watchlists={watchlists}
+            activeWatchlistId={activeWatchlist?.id || 'default'}
+            onSelectWatchlist={(id) => setActiveWatchlistId(id)}
+            onCreateWatchlist={handleCreateWatchlist}
+            onRenameWatchlist={handleRenameWatchlist}
+            onDeleteWatchlist={handleDeleteWatchlist}
             onToggleWatchlist={handleToggleWatchlist}
             onUpdateWatchlistItem={handleUpdateWatchlistItem}
             onRemoveFromWatchlist={handleRemoveFromWatchlist}
             onAddFromWatchlistToPortfolio={handleAddFromWatchlistToPortfolio}
             onOpenDeepDive={handleOpenDeepDive}
             onSelectStock={(stk) => setSelectedStockForModal(stk)}
+            onRegisterTickers={handleRegisterTickers}
             livePrices={livePrices}
             currentLang={currentLang}
           />
@@ -1034,6 +1161,7 @@ export default function App() {
             stocks={stocks}
             selectedStock={selectedStockForDeepDive}
             onSelectStock={(stk) => setSelectedStockForDeepDive(stk)}
+            currentLang={currentLang}
           />
         )}
 

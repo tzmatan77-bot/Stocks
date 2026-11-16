@@ -27,6 +27,8 @@ import {
   BookOpen,
   Printer,
   Flame,
+  Sunrise,
+  Sunset,
 } from 'lucide-react';
 import { SupportedLanguage, SUPPORTED_LANGUAGES, translations } from '../i18n';
 import { StockLogoBadge } from './StockLogoBadge';
@@ -86,7 +88,9 @@ export const Header: React.FC<HeaderProps> = ({
   // Primary core user-friendly tabs - now includes dedicated Institutional Tools page tab
   const primaryTabs = [
     { id: 'home', label: t.tabHome || 'Home', icon: Home, badge: 'AI' },
-    { id: 'premarket', label: isHe ? '🔥 טרום-מסחר (Top 10)' : '🔥 Pre-Market (Top 10)', icon: Flame, badge: 'LIVE' },
+    { id: 'premarket_session', label: isHe ? 'טרום-מסחר' : 'Pre-Market', icon: Sunrise, badge: 'LIVE' },
+    { id: 'afterhours_session', label: isHe ? 'לאחר סגירה' : 'After-Hours', icon: Sunset, badge: 'LIVE' },
+    { id: 'premarket', label: isHe ? 'חדשות יומיות' : 'Daily News', icon: Flame, badge: 'LIVE' },
     { id: 'top10', label: t.tabTop10Scanner || 'Top 30', icon: Award, badge: '30' },
     { id: 'explore', label: t.tabExplore || 'Discover', icon: Compass, badge: 'S&P/NDQ' },
     { id: 'toolshub', label: t.tabToolsHub || '🛠️ כלים מוסדיים', icon: SlidersHorizontal, badge: '14' },

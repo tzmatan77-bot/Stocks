@@ -325,6 +325,13 @@ export interface WatchlistItem {
   notes?: string;
 }
 
+export interface NamedWatchlist {
+  id: string;
+  name: string;
+  createdAt: string;
+  items: WatchlistItem[];
+}
+
 export interface UniverseScreenResult {
   lastUpdated: string;
   totalUniverseScanned: number;
@@ -366,6 +373,8 @@ export interface PremarketNewsItem {
   sourceUrl?: string;
   publishedTime: string; // e.g. "07:15 AM EST"
   date: string;
+  isLiveRss?: boolean;
+  newsDateKey?: string; // YYYY-MM-DD
   category: PremarketCategory;
   sentiment: PremarketSentiment;
   preMarketPrice?: number;
@@ -377,6 +386,19 @@ export interface PremarketNewsItem {
   indexOrigin?: PremarketIndexOrigin;
   estimatedImpactPct?: string; // e.g. "+8% to +14%" or "-7% to -18%"
   catalystSeverity?: 'HIGH' | 'CRITICAL' | 'MODERATE';
+  // Explicit Investor Reaction Analysis ("ניתוח תגובה")
+  reactionAnalysis?: {
+    expectedReaction: 'POSITIVE_UP' | 'NEGATIVE_DOWN' | 'MIXED_VOLATILE';
+    expectedReactionLabelHe: string;
+    expectedReactionLabelEn: string;
+    expectedMoveRange?: string;
+    whyReactingHe: string;
+    whyReactingEn: string;
+    isOverreactionOrRealHe: string;
+    isOverreactionOrRealEn: string;
+    howToRespondHe: string;
+    howToRespondEn: string;
+  };
   // Deep Institutional Recommendation & Analysis
   recommendation: {
     action: PremarketRecommendationAction;

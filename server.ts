@@ -1,7 +1,7 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import dotenv from 'dotenv';
 import { safeParseJsonArray, safeParseJsonObject } from './src/utils/geminiJsonUtils.ts';
 import { FULL_UNIVERSE_RESULT, TOP_20_SUMMARY_LIST } from './src/data/universeData.ts';
@@ -295,8 +295,13 @@ async function fetchRealMarketQuote(ticker: string): Promise<LiveMarketQuote> {
 }
 
 // API Routes
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: new Date().toISOString(), universeCount: TOP_20_SUMMARY_LIST.length });
+app.get('/api/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: Math.floor(process.uptime()),
+    timestamp: Date.now(),
+    universeCount: TOP_20_SUMMARY_LIST.length,
+  });
 });
 
 const USER_PORTFOLIO_FILE = path.join(process.cwd(), 'user-portfolio.json');
@@ -509,10 +514,540 @@ app.get('/api/universe', (req, res) => {
   res.json(enriched);
 });
 
-// Cache for live pre-market daily feed
+// ============================================================================
+// EXTENDED HOURS ENGINE: Live Pre-Market (11:00-16:30 IL) & After-Hours (23:00-03:00 IL)
+// ============================================================================
+interface ExtendedSessionSnapshot {
+  price: number;
+  referenceClose: number;
+  changeAmount: number;
+  changePercent: number;
+  lastTradeTime: number;
+  isCurrentToday: boolean;
+  volume: number;
+}
+
+interface ExtendedHoursQuote {
+  ticker: string;
+  companyName: string;
+  currency: string;
+  regularPrice: number;
+  previousClose: number;
+  regularChangePercent: number;
+  currentSessionState: 'PRE_MARKET' | 'REGULAR_MARKET' | 'AFTER_HOURS' | 'CLOSED';
+  preMarket: ExtendedSessionSnapshot | null;
+  afterHours: ExtendedSessionSnapshot | null;
+  source: string;
+  fetchedAt: number;
+}
+
+const extendedHoursCache = new Map<string, { data: ExtendedHoursQuote; expiresAt: number }>();
+const inFlightExtendedRequests = new Map<string, Promise<ExtendedHoursQuote | null>>();
+let cachedMoversUniverse: { tickers: string[]; names: Record<string, string>; expiresAt: number } | null = null;
+const cachedMoversResponse = new Map<string, { payload: any; expiresAt: number }>();
+
+const CURATED_EXTENDED_MOVERS_UNIVERSE = [
+  'NVDA', 'TSLA', 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'AMD', 'INTC', 'AVGO',
+  'SMCI', 'PLTR', 'ARM', 'NFLX', 'SOFI', 'UBER', 'MU', 'MRVL', 'ANET', 'CRWD',
+  'LLY', 'UNH', 'JPM', 'BAC', 'GS', 'COIN', 'MSTR', 'HOOD', 'NIO', 'RIVN',
+  'ORCL', 'QCOM', 'SHOP', 'SNOW', 'CRM', 'ADBE', 'COST', 'WMT', 'PEP', 'KO',
+  'NKE', 'DIS', 'PYPL', 'SQ', 'V', 'MA', 'NOW', 'BKNG', 'NVMI', 'BE', 'ASML', 'TSM'
+];
+
+function getExtendedMarketSessionState(currentTradingPeriod?: any): 'PRE_MARKET' | 'REGULAR_MARKET' | 'AFTER_HOURS' | 'CLOSED' {
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (currentTradingPeriod?.pre && nowSec >= currentTradingPeriod.pre.start && nowSec < currentTradingPeriod.pre.end) {
+    return 'PRE_MARKET';
+  }
+  if (currentTradingPeriod?.regular && nowSec >= currentTradingPeriod.regular.start && nowSec < currentTradingPeriod.regular.end) {
+    return 'REGULAR_MARKET';
+  }
+  if (currentTradingPeriod?.post && nowSec >= currentTradingPeriod.post.start && nowSec <= currentTradingPeriod.post.end) {
+    return 'AFTER_HOURS';
+  }
+  // Fallback clock check in America/New_York
+  const nyDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+  const day = nyDate.getDay();
+  if (day === 0 || day === 6) return 'CLOSED';
+  const mins = nyDate.getHours() * 60 + nyDate.getMinutes();
+  if (mins >= 240 && mins < 570) return 'PRE_MARKET';
+  if (mins >= 570 && mins < 960) return 'REGULAR_MARKET';
+  if (mins >= 960 && mins <= 1200) return 'AFTER_HOURS';
+  return 'CLOSED';
+}
+
+async function fetchExtendedHoursQuote(rawTicker: string, forceRefresh = false): Promise<ExtendedHoursQuote | null> {
+  const cleanRaw = rawTicker.toUpperCase().trim();
+  const resolved = SERVER_TICKER_ALIASES[cleanRaw] || cleanRaw;
+  const financeTicker = normalizeTickerForFinance(resolved);
+
+  if (!forceRefresh) {
+    const cached = extendedHoursCache.get(resolved);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.data;
+    }
+  }
+
+  const inFlight = inFlightExtendedRequests.get(resolved);
+  if (inFlight) return inFlight;
+
+  const promise = (async (): Promise<ExtendedHoursQuote | null> => {
+    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+
+    for (const host of hosts) {
+      try {
+        const url = `https://${host}/v8/finance/chart/${encodeURIComponent(financeTicker)}?interval=5m&range=2d&includePrePost=true`;
+        const res = await fetch(url, {
+          headers: { 'User-Agent': ua, Accept: 'application/json' },
+          signal: AbortSignal.timeout(5000),
+        });
+        if (!res.ok) continue;
+
+        const json: any = await res.json();
+        const result = json?.chart?.result?.[0];
+        const meta = result?.meta;
+        if (!meta || typeof meta.regularMarketPrice !== 'number') continue;
+
+        const currencyCode = (meta.currency || 'USD').toUpperCase();
+        const fx = FX_RATES_TO_USD[currencyCode] || 1.0;
+
+        const ts: number[] = Array.isArray(result.timestamp) ? result.timestamp : [];
+        const closes: Array<number | null> = result.indicators?.quote?.[0]?.close || [];
+        const volumes: Array<number | null> = result.indicators?.quote?.[0]?.volume || [];
+
+        const bars = ts
+          .map((t, i) => ({ t, c: closes[i], v: volumes[i] || 0 }))
+          .filter((b): b is { t: number; c: number; v: number } => typeof b.c === 'number' && !isNaN(b.c));
+
+        const tp = meta.tradingPeriods || {};
+        const prePeriods: Array<{ start: number; end: number }> = Array.isArray(tp.pre) ? tp.pre.flat() : [];
+        const regPeriods: Array<{ start: number; end: number }> = Array.isArray(tp.regular) ? tp.regular.flat() : [];
+        const postPeriods: Array<{ start: number; end: number }> = Array.isArray(tp.post) ? tp.post.flat() : [];
+
+        // Latest regular price & previous close
+        const latestRegPeriod = regPeriods[regPeriods.length - 1];
+        const prevRegPeriod = regPeriods.length >= 2 ? regPeriods[regPeriods.length - 2] : null;
+        const prevRegBars = prevRegPeriod
+          ? bars.filter((b) => b.t >= prevRegPeriod.start && b.t <= prevRegPeriod.end)
+          : [];
+        const prevCloseRaw =
+          (typeof meta.previousClose === 'number' && meta.previousClose > 0 ? meta.previousClose : null) ??
+          prevRegBars[prevRegBars.length - 1]?.c ??
+          meta.chartPreviousClose ??
+          meta.regularMarketPrice;
+
+        const regularPriceRaw = meta.regularMarketPrice;
+        const regularPrice = Number((regularPriceRaw * fx).toFixed(2));
+        const previousClose = Number((prevCloseRaw * fx).toFixed(2));
+        const regularChangePercent =
+          previousClose > 0 ? Number((((regularPrice - previousClose) / previousClose) * 100).toFixed(2)) : 0;
+
+        // Extract latest PRE-MARKET session with trades
+        let preMarket: ExtendedSessionSnapshot | null = null;
+        for (let idx = prePeriods.length - 1; idx >= 0; idx--) {
+          const p = prePeriods[idx];
+          const sessionBars = bars.filter((b) => b.t >= p.start && b.t < p.end);
+          if (sessionBars.length > 0) {
+            const lastBar = sessionBars[sessionBars.length - 1];
+            // Reference close is the last regular bar before this pre-market started (or previousClose if idx is latest)
+            const priorReg = bars.filter((b) =>
+              regPeriods.some((rp) => b.t >= rp.start && b.t <= rp.end && rp.end <= p.start)
+            );
+            const refRaw = priorReg.length > 0 ? priorReg[priorReg.length - 1].c : prevCloseRaw;
+            const pUsd = Number((lastBar.c * fx).toFixed(2));
+            const refUsd = Number((refRaw * fx).toFixed(2));
+            const chgAmt = Number((pUsd - refUsd).toFixed(2));
+            const chgPct = refUsd > 0 ? Number(((chgAmt / refUsd) * 100).toFixed(2)) : 0;
+            preMarket = {
+              price: pUsd,
+              referenceClose: refUsd,
+              changeAmount: chgAmt,
+              changePercent: chgPct,
+              lastTradeTime: lastBar.t * 1000,
+              isCurrentToday: idx === prePeriods.length - 1,
+              volume: sessionBars.reduce((acc, b) => acc + (b.v || 0), 0),
+            };
+            break;
+          }
+        }
+
+        // Extract latest AFTER-HOURS session with trades
+        let afterHours: ExtendedSessionSnapshot | null = null;
+        for (let idx = postPeriods.length - 1; idx >= 0; idx--) {
+          const p = postPeriods[idx];
+          const sessionBars = bars.filter((b) => b.t >= p.start && b.t <= p.end);
+          if (sessionBars.length > 0) {
+            const lastBar = sessionBars[sessionBars.length - 1];
+            const priorReg = bars.filter((b) =>
+              regPeriods.some((rp) => b.t >= rp.start && b.t <= rp.end && rp.end <= p.start)
+            );
+            const refRaw =
+              idx === postPeriods.length - 1
+                ? (priorReg.length > 0 ? priorReg[priorReg.length - 1].c : regularPriceRaw)
+                : priorReg[priorReg.length - 1]?.c ?? prevCloseRaw;
+            const pUsd = Number((lastBar.c * fx).toFixed(2));
+            const refUsd = Number((refRaw * fx).toFixed(2));
+            const chgAmt = Number((pUsd - refUsd).toFixed(2));
+            const chgPct = refUsd > 0 ? Number(((chgAmt / refUsd) * 100).toFixed(2)) : 0;
+            afterHours = {
+              price: pUsd,
+              referenceClose: refUsd,
+              changeAmount: chgAmt,
+              changePercent: chgPct,
+              lastTradeTime: lastBar.t * 1000,
+              isCurrentToday: idx === postPeriods.length - 1,
+              volume: sessionBars.reduce((acc, b) => acc + (b.v || 0), 0),
+            };
+            break;
+          }
+        }
+
+        const known = GLOBAL_STOCK_KNOWLEDGE[resolved];
+        const snapshot: ExtendedHoursQuote = {
+          ticker: resolved,
+          companyName: meta.shortName || meta.longName || known?.name || `${resolved} Corp.`,
+          currency: 'USD',
+          regularPrice,
+          previousClose,
+          regularChangePercent,
+          currentSessionState: getExtendedMarketSessionState(meta.currentTradingPeriod),
+          preMarket,
+          afterHours,
+          source: 'yahoo_extended_live',
+          fetchedAt: Date.now(),
+        };
+
+        extendedHoursCache.set(resolved, {
+          data: snapshot,
+          expiresAt: Date.now() + 25000,
+        });
+        return snapshot;
+      } catch {
+        // try next host
+      }
+    }
+    return null;
+  })();
+
+  inFlightExtendedRequests.set(resolved, promise);
+  try {
+    return await promise;
+  } finally {
+    inFlightExtendedRequests.delete(resolved);
+  }
+}
+
+async function getDynamicMoversUniverse(): Promise<{ tickers: string[]; names: Record<string, string> }> {
+  if (cachedMoversUniverse && cachedMoversUniverse.expiresAt > Date.now()) {
+    return cachedMoversUniverse;
+  }
+
+  const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  const tickersSet = new Set<string>(CURATED_EXTENDED_MOVERS_UNIVERSE);
+  const names: Record<string, string> = {};
+
+  const screenerUrls = [
+    'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_gainers&count=15',
+    'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=day_losers&count=15',
+    'https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?scrIds=most_actives&count=15',
+  ];
+
+  const tasks = screenerUrls.map(async (url) => {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': ua }, signal: AbortSignal.timeout(4000) });
+      if (!r.ok) return;
+      const j: any = await r.json();
+      const quotes = j?.finance?.result?.[0]?.quotes || [];
+      for (const q of quotes) {
+        const sym = String(q?.symbol || '').toUpperCase().trim();
+        if (sym && /^[A-Z.-]{1,6}$/.test(sym) && !sym.startsWith('^')) {
+          tickersSet.add(sym);
+          if (q.shortName || q.longName) names[sym] = q.shortName || q.longName;
+        }
+      }
+    } catch {
+      // ignore screener failure
+    }
+  });
+
+  tasks.push(
+    (async () => {
+      try {
+        const r = await fetch('https://query2.finance.yahoo.com/v1/finance/trending/US?count=15', {
+          headers: { 'User-Agent': ua },
+          signal: AbortSignal.timeout(4000),
+        });
+        if (!r.ok) return;
+        const j: any = await r.json();
+        const quotes = j?.finance?.result?.[0]?.quotes || [];
+        for (const q of quotes) {
+          const sym = String(q?.symbol || '').toUpperCase().trim();
+          if (sym && /^[A-Z.-]{1,6}$/.test(sym) && !sym.startsWith('^')) {
+            tickersSet.add(sym);
+          }
+        }
+      } catch {
+        // ignore
+      }
+    })()
+  );
+
+  await Promise.allSettled(tasks);
+  const result = {
+    tickers: Array.from(tickersSet).slice(0, 75),
+    names,
+    expiresAt: Date.now() + 5 * 60 * 1000,
+  };
+  cachedMoversUniverse = result;
+  return result;
+}
+
+async function fetchExtendedBatchInChunks(tickers: string[]): Promise<ExtendedHoursQuote[]> {
+  const unique = Array.from(new Set(tickers.map((t) => String(t).toUpperCase().trim()).filter(Boolean))).slice(0, 80);
+  const results: ExtendedHoursQuote[] = [];
+  const chunkSize = 12;
+  for (let i = 0; i < unique.length; i += chunkSize) {
+    const chunk = unique.slice(i, i + chunkSize);
+    const settled = await Promise.allSettled(chunk.map((t) => fetchExtendedHoursQuote(t)));
+    settled.forEach((s) => {
+      if (s.status === 'fulfilled' && s.value) results.push(s.value);
+    });
+  }
+  return results;
+}
+
+// Search ANY stock ticker in Pre-Market & After-Hours
+app.get('/api/extended-hours/quote/:ticker', async (req, res) => {
+  try {
+    const raw = String(req.params.ticker || '').trim();
+    if (!raw) {
+      res.status(400).json({ error: 'Ticker is required' });
+      return;
+    }
+    const quote = await fetchExtendedHoursQuote(raw, req.query.refresh === 'true');
+    if (!quote) {
+      res.status(404).json({ error: `Could not find live extended-hours quote for ${raw.toUpperCase()}` });
+      return;
+    }
+    res.json({ quote, timestamp: Date.now() });
+  } catch (err) {
+    console.error('Error in /api/extended-hours/quote:', err);
+    res.status(500).json({ error: 'Failed to fetch extended-hours quote' });
+  }
+});
+
+// Batch fetch extended-hours quotes for User Portfolio & Watchlist stocks
+app.all('/api/extended-hours/batch', async (req, res) => {
+  try {
+    const bodyTickers = Array.isArray(req.body?.tickers) ? req.body.tickers : [];
+    const queryTickers = typeof req.query.tickers === 'string' ? req.query.tickers.split(',') : [];
+    const combined = [...bodyTickers, ...queryTickers]
+      .map((t: string) => String(t || '').trim().toUpperCase())
+      .filter((t: string) => t.length > 0 && t.length <= 10);
+
+    if (combined.length === 0) {
+      res.json({ quotes: [], sessionState: getExtendedMarketSessionState(), timestamp: Date.now() });
+      return;
+    }
+
+    const quotes = await fetchExtendedBatchInChunks(combined);
+    res.json({
+      quotes,
+      sessionState: quotes[0]?.currentSessionState || getExtendedMarketSessionState(),
+      timestamp: Date.now(),
+    });
+  } catch (err) {
+    console.error('Error in /api/extended-hours/batch:', err);
+    res.status(500).json({ error: 'Failed to fetch batch extended-hours quotes' });
+  }
+});
+
+// Live Top Gainers & Top Losers in Pre-Market (PRE) or After-Hours (POST)
+app.get('/api/extended-hours/movers', async (req, res) => {
+  try {
+    const sessionParam = String(req.query.session || 'PRE').toUpperCase() === 'POST' ? 'POST' : 'PRE';
+    const force = req.query.refresh === 'true';
+
+    if (!force) {
+      const cached = cachedMoversResponse.get(sessionParam);
+      if (cached && cached.expiresAt > Date.now()) {
+        res.json(cached.payload);
+        return;
+      }
+    }
+
+    const { tickers, names } = await getDynamicMoversUniverse();
+    const allQuotes = await fetchExtendedBatchInChunks(tickers);
+
+    const enriched = allQuotes
+      .map((q) => ({
+        ...q,
+        companyName: names[q.ticker] || q.companyName,
+        activeSession: sessionParam === 'PRE' ? q.preMarket : q.afterHours,
+      }))
+      .filter((q) => q.activeSession !== null);
+
+    const gainers = enriched
+      .filter((q) => (q.activeSession?.changePercent ?? 0) > 0)
+      .sort((a, b) => (b.activeSession?.changePercent ?? 0) - (a.activeSession?.changePercent ?? 0))
+      .slice(0, 15);
+
+    const losers = enriched
+      .filter((q) => (q.activeSession?.changePercent ?? 0) < 0)
+      .sort((a, b) => (a.activeSession?.changePercent ?? 0) - (b.activeSession?.changePercent ?? 0))
+      .slice(0, 15);
+
+    const nyDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const ilDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' }));
+
+    const payload = {
+      session: sessionParam,
+      currentMarketState: allQuotes[0]?.currentSessionState || getExtendedMarketSessionState(),
+      isLiveSessionNow:
+        sessionParam === 'PRE'
+          ? getExtendedMarketSessionState() === 'PRE_MARKET'
+          : getExtendedMarketSessionState() === 'AFTER_HOURS',
+      nyTimeStr: nyDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false }),
+      israelTimeStr: ilDate.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }),
+      totalScanned: allQuotes.length,
+      gainers,
+      losers,
+      timestamp: Date.now(),
+    };
+
+    cachedMoversResponse.set(sessionParam, {
+      payload,
+      expiresAt: Date.now() + 40000,
+    });
+
+    res.json(payload);
+  } catch (err) {
+    console.error('Error in /api/extended-hours/movers:', err);
+    res.status(500).json({ error: 'Failed to scan extended-hours movers' });
+  }
+});
+
+// Cache for live daily news feed & reaction analysis
 let cachedPremarketNews: any[] = [...INITIAL_PREMARKET_NEWS_FEED];
 let lastPremarketNewsGenerated = Date.now();
 let lastQuotesEnrichedTime = 0;
+let lastRssSyncDateKey = '';
+const dailyAiNewsCache = new Map<string, {
+  headlineHe: string;
+  summaryHe: string;
+  expectedReaction: 'POSITIVE_UP' | 'NEGATIVE_DOWN' | 'MIXED_VOLATILE';
+  whyReactingHe: string;
+  isOverreactionOrRealHe: string;
+  howToRespondHe: string;
+  expectedMoveRange?: string;
+}>();
+
+function getTodayDateKey(): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jerusalem',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
+function buildContextualReactionAnalysis(params: {
+  ticker: string;
+  title: string;
+  source: string;
+  sentiment: string;
+  catalystType?: string;
+  liveChangePercent?: number;
+  knownMoatHe?: string;
+  aiOverride?: {
+    expectedReaction?: 'POSITIVE_UP' | 'NEGATIVE_DOWN' | 'MIXED_VOLATILE';
+    whyReactingHe?: string;
+    isOverreactionOrRealHe?: string;
+    howToRespondHe?: string;
+    expectedMoveRange?: string;
+  };
+}) {
+  const { ticker, title, source, sentiment, catalystType, liveChangePercent, knownMoatHe, aiOverride } = params;
+  const lower = (title || '').toLowerCase();
+  const hasLiveChg = typeof liveChangePercent === 'number' && !isNaN(liveChangePercent);
+  const liveChgStr = hasLiveChg ? `${liveChangePercent >= 0 ? '+' : ''}${liveChangePercent.toFixed(2)}%` : '';
+
+  const expectedReaction: 'POSITIVE_UP' | 'NEGATIVE_DOWN' | 'MIXED_VOLATILE' =
+    aiOverride?.expectedReaction ||
+    (sentiment === 'BEARISH' || (hasLiveChg && liveChangePercent! <= -1.2)
+      ? 'NEGATIVE_DOWN'
+      : sentiment === 'BULLISH' || (hasLiveChg && liveChangePercent! >= 0.8)
+      ? 'POSITIVE_UP'
+      : 'MIXED_VOLATILE');
+
+  const expectedReactionLabelHe =
+    expectedReaction === 'POSITIVE_UP'
+      ? hasLiveChg && liveChangePercent! > 0.3
+        ? `תגובה חיובית (המניה עולה ${liveChgStr})`
+        : 'צפי לתגובה חיובית (נטייה לעליות)'
+      : expectedReaction === 'NEGATIVE_DOWN'
+      ? hasLiveChg && liveChangePercent! < -0.3
+        ? `תגובת לחץ (המניה יורדת ${liveChgStr})`
+        : 'צפי לתגובת לחץ (נטייה לירידות)'
+      : 'תגובה מעורבת / תנודתיות נקודתית';
+
+  const expectedReactionLabelEn =
+    expectedReaction === 'POSITIVE_UP'
+      ? 'Positive Upside Reaction'
+      : expectedReaction === 'NEGATIVE_DOWN'
+      ? 'Downside Pressure Reaction'
+      : 'Mixed / Volatile Reaction';
+
+  const expectedMoveRange =
+    aiOverride?.expectedMoveRange ||
+    (expectedReaction === 'POSITIVE_UP' ? '+2% עד +6%' : expectedReaction === 'NEGATIVE_DOWN' ? '-2% עד -7%' : '±1.5%');
+
+  let defaultWhyHe = '';
+  let defaultOverreactionHe = '';
+  let defaultRespondHe = '';
+
+  if (/resign|step.*down|depart|ouster|ceo/.test(lower)) {
+    defaultWhyHe = `שינוי בהנהלה הבכירה של ${ticker} יוצר אי-ודאות מיידית בקרב משקיעים מוסדיים, שעוצרים לבחון האם האסטרטגיה תימשך באותו קצב.`;
+    defaultOverreactionHe = 'בטווח של ימים ראשונים השוק נוטה להגיב בחריפות-יתר לפני מינוי מחליף; המבחן האמיתי הוא המשכיות הצמיחה ברבעון הבא.';
+    defaultRespondHe = 'לא למהר לקנות או למכור בבהלה — להמתין יומיים-שלושה להתייצבות המחיר ולדיווח רשמי מהדירקטוריון.';
+  } else if (catalystType === 'EARNINGS_BEAT' || /beat|surge|soar|record|strong revenue|raises? guidance/.test(lower)) {
+    defaultWhyHe = `הדיווח מצביע על ביקוש חזק מהצפוי או שיפור בתחזית ההכנסות של ${ticker}, מה שדוחף משקיעים לתמחר צמיחה גבוהה יותר ברווחים.`;
+    defaultOverreactionHe = 'כאשר העלייה מגובה בתוצאות כספיות או העלאת תחזית (Guidance), לרוב מדובר במומנטום מבוסס ולא ברעש חולף.';
+    defaultRespondHe = 'למשקיעים קיימים: להמשיך להחזיק. למצטרפים חדשים: להימנע ממרדף אחרי פתיחה חדה ולחכות לנסיגה קלה לטווח כניסה נוח.';
+  } else if (catalystType === 'GUIDANCE_CUT' || /miss|cut|slash|warn|probe|lawsuit|downgrade|tariff|recall/.test(lower)) {
+    defaultWhyHe = `המשקיעים מתמחרים סיכון לפגיעה בקצב הצמיחה או ברווחיות של ${ticker} בעקבות אזהרה, הורדת תחזית או לחץ חיצוני (${source}).`;
+    defaultOverreactionHe = knownMoatHe
+      ? `צריך לבדוק אם מדובר בבעיה נקודתית או בפגיעה ביתרון המרכזי של החברה: ${knownMoatHe}`
+      : 'אם התחזית לשנה הקרובה ירדה ממשית — הלחץ עלול להימשך מספר ימים; אם זו כותרת חולפת, ייתכן שמדובר בהגזמה.';
+    defaultRespondHe = 'מומלץ להמתין להתייצבות מחזורי המסחר ולא לקנות "סכין נופלת" ביום ההודעה הראשון.';
+  } else if (/upgrade|overweight|buy rating|top pick|price target raised/.test(lower)) {
+    defaultWhyHe = `בתי השקעות ואנליסטים (${source}) העלו דירוג או מחיר יעד עבור ${ticker}, מה שמושך קניות של קרנות ומשקיעים עוקבים.`;
+    defaultOverreactionHe = 'שדרוג המלצה מוסדי מחזק את הסנטימנט הקצר, אך חשוב לוודא שהשווי הנוכחי עדיין סביר ביחס לרווח.';
+    defaultRespondHe = 'הזדמנות לבחון איסוף הדרגתי בתיק או במעקב, תוך בדיקת תוצאות הרבעון האחרון.';
+  } else if (/ai|chip|blackwell|cloud|data center|contract|deal|partnership/.test(lower)) {
+    defaultWhyHe = `חדשות על חוזים, שיתופי פעולה או השקות טכנולוגיות (${ticker}) מחזקות את הציפייה להגדלת הכנסות עתידית.`;
+    defaultOverreactionHe = 'אם מדובר בהסכם מסחרי מחייב עם לקוח גדול זו השפעה מהותית; אם זו שמועה ראשונית, ייתכן שהתגובה תתאזן.';
+    defaultRespondHe = 'לעקוב אחר מחיר המניה בימים הקרובים ולצרף לרשימת המעקב לבדיקת השפעה על הדוח הרבעוני הקרוב.';
+  } else {
+    defaultWhyHe = `הדיווח היומי ב-${source} מרכז עניין סביב ${ticker}${hasLiveChg ? ` והמניה מגיבה כעת בתנועה של ${liveChgStr}` : ''}, כאשר השוק מעכל את המשמעות העסקית לימים הקרובים.`;
+    defaultOverreactionHe = 'בשעות הראשונות התגובה משקפת בעיקר סנטימנט מהיר של כותרות; ההשפעה האמיתית תימדד לפי שינוי בהכנסות וברווחיות.';
+    defaultRespondHe = 'להתעדכן בפרטי הכתבה, לבדוק האם זה משנה את הסיבה שבגללה המניה אצלך במעקב, ולהימנע מפעולה חפוזה.';
+  }
+
+  return {
+    expectedReaction,
+    expectedReactionLabelHe,
+    expectedReactionLabelEn,
+    expectedMoveRange,
+    whyReactingHe: aiOverride?.whyReactingHe || defaultWhyHe,
+    whyReactingEn: `Market reaction driven by ${source} report on ${ticker}.`,
+    isOverreactionOrRealHe: aiOverride?.isOverreactionOrRealHe || defaultOverreactionHe,
+    isOverreactionOrRealEn: 'Evaluates short-term headline noise vs. fundamental earnings durability.',
+    howToRespondHe: aiOverride?.howToRespondHe || defaultRespondHe,
+    howToRespondEn: 'Monitor price stabilization and focus on underlying business fundamentals.',
+  };
+}
 
 // Map raw RSS news title/description to known market ticker
 function inferTickerFromHeadline(title: string, defaultTicker: string = 'SPY'): string {
@@ -550,20 +1085,19 @@ function inferTickerFromHeadline(title: string, defaultTicker: string = 'SPY'): 
 function formatRssPublishedTime(pubDateStr: string): { timeLabel: string; dateLabel: string; timestampMs: number } {
   const parsed = pubDateStr ? Date.parse(pubDateStr) : NaN;
   if (isNaN(parsed)) {
-    const nyNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+    const ilNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' }));
     return {
-      timeLabel: nyNow.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true }) + ' EST',
+      timeLabel: ilNow.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }),
       dateLabel: 'היום • מבזק חי',
       timestampMs: Date.now(),
     };
   }
   const diffMin = Math.max(0, Math.floor((Date.now() - parsed) / 60000));
-  const estStr = new Date(parsed).toLocaleTimeString('en-US', {
+  const ilStr = new Date(parsed).toLocaleTimeString('he-IL', {
     hour: '2-digit',
     minute: '2-digit',
-    hour12: true,
-    timeZone: 'America/New_York',
-  }) + ' EST';
+    timeZone: 'Asia/Jerusalem',
+  });
 
   let relHe = '';
   if (diffMin < 2) relHe = 'עכשיו • עדכון חי';
@@ -572,15 +1106,20 @@ function formatRssPublishedTime(pubDateStr: string): { timeLabel: string; dateLa
   else relHe = `${new Date(parsed).toLocaleDateString('he-IL')}`;
 
   return {
-    timeLabel: estStr,
+    timeLabel: ilStr,
     dateLabel: relHe,
     timestampMs: parsed,
   };
 }
 
-// Fetch live real-time breaking Wall Street RSS stories and merge at the top of cachedPremarketNews
+// Fetch live real-time breaking daily news stories and enrich with reaction analysis
 async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void> {
-  if (!force && Date.now() - lastRssNewsSyncTime < 90000) return;
+  const todayKey = getTodayDateKey();
+  const dayRolledOver = lastRssSyncDateKey !== todayKey;
+  if (!force && !dayRolledOver && Date.now() - lastRssNewsSyncTime < 90000) return;
+  if (dayRolledOver) {
+    dailyAiNewsCache.clear();
+  }
 
   try {
     const tickerBatch1 = 'TSLA,AAPL,MSFT,GOOGL,AMZN,META,NVMI,BE,INTC';
@@ -693,7 +1232,7 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
       return `🔴 מבזק שוק חי • ${ticker} (${sourceName}): ${rawTitle}`;
     };
 
-    // Build structured live news cards
+    // Build structured daily news cards with explicit reaction analysis
     const liveRssCards: any[] = freshestItems.map((raw, idx) => {
       const ticker = inferTickerFromHeadline(raw.title, 'SPY');
       const sourceInfo = normalizeSource(raw.title, raw.source);
@@ -702,26 +1241,43 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
       const isBear = sentiment === 'BEARISH';
       const isBull = sentiment === 'BULLISH';
       const knownInfo = GLOBAL_STOCK_KNOWLEDGE[ticker];
-      const companyName = knownInfo?.name || (ticker === 'SPY' ? 'S&P 500 / Macro Market' : `${ticker} Corp.`);
+      const companyName = knownInfo?.name || (ticker === 'SPY' ? 'S&P 500 / כללי' : `${ticker} Corp.`);
 
       const fallbackPrice = KNOWN_CATALOG_PRICES[ticker] || 150.0;
       const targetPrice = Number((fallbackPrice * (isBear ? 1.06 : 1.18)).toFixed(2));
       const buyZoneMax = Number((fallbackPrice * (isBear ? 0.94 : 1.02)).toFixed(2));
       const heHeadline = formatBreakingHeadlineHe(raw.title, sourceInfo.name, ticker);
+      const cacheKey = `${todayKey}:${ticker}:${raw.title.slice(0, 80)}`;
+      const cachedAi = dailyAiNewsCache.get(cacheKey);
+
+      const reactionAnalysis = buildContextualReactionAnalysis({
+        ticker,
+        title: raw.title,
+        source: sourceInfo.name,
+        sentiment,
+        catalystType,
+        knownMoatHe: knownInfo?.moatHe,
+        aiOverride: cachedAi,
+      });
 
       return {
         id: `rss-live-${ticker.toLowerCase()}-${idx}-${raw.timestampMs}`,
         isLiveRss: true,
+        newsDateKey: todayKey,
+        rawTitleEn: raw.title,
+        _aiCacheKey: cacheKey,
         ticker,
         companyName,
-        headline: heHeadline,
-        _baseHeadline: heHeadline,
-        summary: raw.snippet && raw.snippet !== raw.title
-          ? `${raw.snippet}`
-          : `דיווח שוטף מ-${sourceInfo.name} (${raw.dateLabel} • ${raw.timeLabel}): ${raw.title}`,
+        headline: cachedAi?.headlineHe || heHeadline,
+        _baseHeadline: cachedAi?.headlineHe || heHeadline,
+        summary: cachedAi?.summaryHe || (
+          raw.snippet && raw.snippet !== raw.title
+            ? `${raw.snippet}`
+            : `דיווח יומי מ-${sourceInfo.name} (${raw.dateLabel} • ${raw.timeLabel}): ${raw.title}`
+        ),
         source: sourceInfo.name,
         sourceUrl: raw.link || sourceInfo.url,
-        publishedTime: `${raw.timeLabel} (${raw.dateLabel})`,
+        publishedTime: `${raw.timeLabel} · ${raw.dateLabel}`,
         date: raw.dateLabel,
         category: ticker === 'SPY' ? 'MACRO_RATES' : 'EARNINGS_CATALYST',
         sentiment,
@@ -729,53 +1285,67 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
         messageCategory: isBear ? 'DROP_WARNING' : isBull ? 'SHARP_RISE' : 'FORECAST_REVISION',
         catalystType,
         indexOrigin: 'BOTH',
-        estimatedImpactPct: isBear ? '-3% עד -8%' : isBull ? '+3% עד +6%' : '±2.0%',
+        estimatedImpactPct: reactionAnalysis.expectedMoveRange,
         catalystSeverity,
         preMarketPrice: fallbackPrice,
         preMarketChangePercent: 0,
+        reactionAnalysis,
         recommendation: {
           action: isBear ? 'CAUTION_ALERT' : isBull ? 'STRONG_BUY' : 'HOLD_MONITOR',
-          actionLabelHe: isBear ? '⚠️ זהירות - מעקב תנודתיות וסיכון' : isBull ? '🚀 מומנטום חיובי - הזדמנות איסוף' : '📊 מעקב שוק וניתוח',
-          actionLabelEn: isBear ? 'Caution - Volatility Watch' : isBull ? 'Bullish Momentum' : 'Monitor',
+          actionLabelHe: isBear ? 'זהירות - מעקב והמתנה להתייצבות' : isBull ? 'מומנטום חיובי - הזדמנות למעקב/איסוף' : 'מעקב מסודר ללא צעד חפוז',
+          actionLabelEn: isBear ? 'Caution - Wait for Support' : isBull ? 'Bullish Momentum' : 'Monitor',
           confidenceScore: 92,
           impactOn5YearThesis: isBear ? 'TEMPORARY_NOISE' : 'STRENGTHENS_MOAT',
-          impactAnalysisHe: knownInfo?.moatHe
-            ? `הקשר עסקי (${ticker}): ${knownInfo.moatHe} יש לבחון האם אירוע החדשות משנה את תזת הצמיחה ארוכת הטווח או מהווה תנודתיות שוק קצרת טווח.`
-            : `ניתוח שוטף לדיווח ב-${sourceInfo.name}: שוק ההון מתמחר כעת את השפעת הידיעה על מניות הסקטור.`,
-          impactAnalysisEn: `Live assessment of ${sourceInfo.name} headline for ${ticker}.`,
-          openingBellGamePlanHe: isBear
-            ? 'להימנע מרכישות נמהרות בפתיחה ולהמתין לייצוב מחזורי המסחר ורמות התמיכה.'
-            : isBull
-            ? 'מעקב אחר כניסות מבוקרות באזורי תמיכה עם ניצול מומנטום החדשות.'
-            : 'מעקב אחר תגובת השוק ללא פעולה חפוזה.',
-          openingBellGamePlanEn: isBear ? 'Wait for price stabilization.' : 'Accumulate selectively.',
+          impactAnalysisHe: reactionAnalysis.whyReactingHe,
+          impactAnalysisEn: reactionAnalysis.whyReactingEn,
+          openingBellGamePlanHe: reactionAnalysis.howToRespondHe,
+          openingBellGamePlanEn: reactionAnalysis.howToRespondEn,
           targetPrice,
           buyZoneMax,
-          riskFactorHe: 'רגישות גבוהה לתנודתיות תוך-יומית בעקבות הכותרת.',
-          riskFactorEn: 'Intraday headline volatility.',
+          riskFactorHe: reactionAnalysis.isOverreactionOrRealHe,
+          riskFactorEn: reactionAnalysis.isOverreactionOrRealEn,
         },
       };
     });
 
-    // Optional fast Gemini Hebrew headline + summary enrichment (up to top 8 items, bounded timeout)
+    // Enrich any uncached top breaking stories today with Gemini 4 Hydrogen (clear Hebrew + Reaction Analysis)
     const ai = getAI();
-    if (isGeminiAvailable() && ai && liveRssCards.length > 0) {
+    const uncachedForAi = liveRssCards
+      .map((card, idx) => ({ card, idx }))
+      .filter(({ card }) => !dailyAiNewsCache.has(card._aiCacheKey))
+      .slice(0, 10);
+
+    if (isGeminiAvailable() && ai && uncachedForAi.length > 0) {
       try {
-        const itemsForAi = liveRssCards.slice(0, 8).map((c, idx) => ({
+        const itemsForAi = uncachedForAi.map(({ card, idx }) => ({
           idx,
-          ticker: c.ticker,
-          title: c.headline,
-          source: c.source,
+          ticker: card.ticker,
+          title: card.rawTitleEn || card.headline,
+          source: card.source,
         }));
-        const trPrompt = `Translate and summarize these ${itemsForAi.length} live breaking Wall Street news headlines into concise, natural institutional Hebrew (no English quotes inside JSON). Keep any breaking tag like 🚨 or 🔴 at start.
-Return a JSON array of objects: [{ "idx": number, "headlineHe": string, "summaryHe": string }].
-Items:\n${JSON.stringify(itemsForAi)}`;
+        const trPrompt = `You are a clear, practical financial news analyst writing in simple, natural Hebrew for retail investors (avoid confusing jargon).
+For each of the ${itemsForAi.length} today's news items below, return a JSON array with:
+- "idx": exact idx number
+- "headlineHe": crisp, clear Hebrew news headline (keep a short tag like 🔴 or 🟢 if helpful, no raw English headlines unless a product/company name)
+- "summaryHe": 2 short, clear Hebrew sentences explaining what happened in the news
+- "expectedReaction": one of "POSITIVE_UP" | "NEGATIVE_DOWN" | "MIXED_VOLATILE"
+- "expectedMoveRange": e.g. "+2% עד +5%" or "-3% עד -7%" or "±1.5%"
+- "whyReactingHe": 1-2 clear Hebrew sentences explaining WHY the stock/market is reacting this way (link news -> revenues, margins, contracts, guidance, or sentiment)
+- "isOverreactionOrRealHe": 1-2 clear Hebrew sentences stating whether the price reaction looks like temporary headline noise / overreaction OR a real business change
+- "howToRespondHe": 1 clear practical Hebrew sentence explaining what the investor should do in response (e.g., wait for stabilization, buy gradually on pullback, hold calmly).
+
+Items:
+${JSON.stringify(itemsForAi)}`;
+
         const aiPromise = ai.models.generateContent({
-          model: 'gemini-2.5-flash',
+          model: 'gemini-4-hydrogen',
           contents: trPrompt,
-          config: { responseMimeType: 'application/json' },
+          config: {
+            responseMimeType: 'application/json',
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          },
         });
-        const timeoutP = new Promise<null>((resolve) => setTimeout(() => resolve(null), 5500));
+        const timeoutP = new Promise<null>((resolve) => setTimeout(() => resolve(null), 9000));
         const res: any = await Promise.race([aiPromise, timeoutP]);
         if (res && res.text) {
           const translated = safeParseJsonArray<any>(res.text);
@@ -783,9 +1353,36 @@ Items:\n${JSON.stringify(itemsForAi)}`;
             for (const tItem of translated) {
               const card = liveRssCards[tItem.idx];
               if (card && tItem.headlineHe) {
-                card.headline = `${tItem.headlineHe}`;
-                card._baseHeadline = card.headline;
+                const normalizedReaction: 'POSITIVE_UP' | 'NEGATIVE_DOWN' | 'MIXED_VOLATILE' =
+                  tItem.expectedReaction === 'POSITIVE_UP' || tItem.expectedReaction === 'NEGATIVE_DOWN'
+                    ? tItem.expectedReaction
+                    : 'MIXED_VOLATILE';
+
+                dailyAiNewsCache.set(card._aiCacheKey, {
+                  headlineHe: tItem.headlineHe,
+                  summaryHe: tItem.summaryHe || card.summary,
+                  expectedReaction: normalizedReaction,
+                  whyReactingHe: tItem.whyReactingHe || card.reactionAnalysis.whyReactingHe,
+                  isOverreactionOrRealHe: tItem.isOverreactionOrRealHe || card.reactionAnalysis.isOverreactionOrRealHe,
+                  howToRespondHe: tItem.howToRespondHe || card.reactionAnalysis.howToRespondHe,
+                  expectedMoveRange: tItem.expectedMoveRange,
+                });
+
+                card.headline = tItem.headlineHe;
+                card._baseHeadline = tItem.headlineHe;
                 if (tItem.summaryHe) card.summary = tItem.summaryHe;
+                card.reactionAnalysis = buildContextualReactionAnalysis({
+                  ticker: card.ticker,
+                  title: card.rawTitleEn || card.headline,
+                  source: card.source,
+                  sentiment: normalizedReaction === 'NEGATIVE_DOWN' ? 'BEARISH' : normalizedReaction === 'POSITIVE_UP' ? 'BULLISH' : 'NEUTRAL',
+                  catalystType: card.catalystType,
+                  aiOverride: dailyAiNewsCache.get(card._aiCacheKey),
+                });
+                card.estimatedImpactPct = card.reactionAnalysis.expectedMoveRange;
+                card.recommendation.impactAnalysisHe = card.reactionAnalysis.whyReactingHe;
+                card.recommendation.openingBellGamePlanHe = card.reactionAnalysis.howToRespondHe;
+                card.recommendation.riskFactorHe = card.reactionAnalysis.isOverreactionOrRealHe;
               }
             }
           }
@@ -795,15 +1392,22 @@ Items:\n${JSON.stringify(itemsForAi)}`;
       }
     }
 
-    // Merge freshest live RSS news with remaining curated coverage (keep curated items for tickers not already duplicated twice)
-    const curatedRemaining = INITIAL_PREMARKET_NEWS_FEED.map((item) => ({
-      ...item,
-      _baseHeadline: item.headline,
-    }));
+    // Prioritize today's live RSS stories; only fall back to curated items if fewer than 6 live RSS stories arrived
+    const combined =
+      liveRssCards.length >= 6
+        ? liveRssCards
+        : [
+            ...liveRssCards,
+            ...INITIAL_PREMARKET_NEWS_FEED.slice(0, Math.max(0, 8 - liveRssCards.length)).map((item) => ({
+              ...item,
+              _baseHeadline: item.headline,
+              newsDateKey: todayKey,
+            })),
+          ];
 
-    const combined = [...liveRssCards, ...curatedRemaining];
     cachedPremarketNews = await enrichPremarketNewsWithLiveQuotes(combined);
     lastRssNewsSyncTime = Date.now();
+    lastRssSyncDateKey = todayKey;
     lastPremarketNewsGenerated = Date.now();
     lastQuotesEnrichedTime = Date.now();
   } catch (err) {
@@ -882,6 +1486,18 @@ async function enrichPremarketNewsWithLiveQuotes(newsItems: any[]): Promise<any[
         }
       }
 
+      const reactionAnalysis =
+        item.reactionAnalysis ||
+        buildContextualReactionAnalysis({
+          ticker: t,
+          title: item.rawTitleEn || resolvedHeadline,
+          source: item.source || 'Wall Street Wire',
+          sentiment: resolvedSentiment,
+          catalystType: item.catalystType,
+          liveChangePercent: live.changePercent,
+          knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[t]?.moatHe,
+        });
+
       return {
         ...item,
         _baseHeadline: item._baseHeadline || item.headline,
@@ -889,6 +1505,7 @@ async function enrichPremarketNewsWithLiveQuotes(newsItems: any[]): Promise<any[
         sentiment: resolvedSentiment,
         messageCategory: resolvedCategory,
         headline: resolvedHeadline,
+        reactionAnalysis,
         recommendation: resolvedRecommendation || item.recommendation,
         preMarketPrice: live.price,
         preMarketChangePercent: live.changePercent,
@@ -896,15 +1513,27 @@ async function enrichPremarketNewsWithLiveQuotes(newsItems: any[]): Promise<any[
         date: item.isLiveRss ? item.date : 'היום • עדכון שוק חי',
       };
     }
-    return item;
+    const reactionAnalysis =
+      item.reactionAnalysis ||
+      buildContextualReactionAnalysis({
+        ticker: t,
+        title: item.rawTitleEn || item.headline,
+        source: item.source || 'Wall Street Wire',
+        sentiment: item.sentiment,
+        catalystType: item.catalystType,
+        liveChangePercent: item.preMarketChangePercent,
+        knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[t]?.moatHe,
+      });
+    return { ...item, reactionAnalysis };
   });
 }
 
-// 1. GET /api/premarket-news - Returns daily pre-market pulse and live breaking news briefing
-app.get('/api/premarket-news', async (req, res) => {
+// 1. GET /api/premarket-news & /api/daily-news - Returns daily breaking news & reaction analysis
+app.get(['/api/premarket-news', '/api/daily-news'], async (req, res) => {
   try {
-    // Ensure live RSS breaking news has been synced at least once or refreshed every 2 minutes
-    if (Date.now() - lastRssNewsSyncTime > 120000) {
+    const todayKey = getTodayDateKey();
+    // Refresh automatically when a new day starts or every 2 minutes
+    if (lastRssSyncDateKey !== todayKey || Date.now() - lastRssNewsSyncTime > 120000) {
       await refreshLiveRssBreakingNews(false);
     } else if (Date.now() - lastQuotesEnrichedTime > 20000) {
       cachedPremarketNews = await enrichPremarketNewsWithLiveQuotes(cachedPremarketNews);
@@ -914,23 +1543,22 @@ app.get('/api/premarket-news', async (req, res) => {
     res.json({
       pulse,
       news: cachedPremarketNews,
+      todayDateKey: todayKey,
       lastUpdated: new Date(lastPremarketNewsGenerated).toISOString(),
       rssSyncedAt: lastRssNewsSyncTime ? new Date(lastRssNewsSyncTime).toISOString() : undefined,
-      source: 'live_financial_terminals_and_rss',
+      source: 'live_daily_news_and_reaction_analysis',
     });
   } catch (err: any) {
-    console.error('Error fetching premarket news:', err);
-    res.status(500).json({ error: 'Failed to fetch premarket news' });
+    console.error('Error fetching daily news:', err);
+    res.status(500).json({ error: 'Failed to fetch daily news' });
   }
 });
 
-// 2. ALL /api/premarket-news/regenerate - Force-sync live breaking RSS stories & live market quotes
+// 2. ALL /api/premarket-news/regenerate - Force-sync live breaking RSS stories & reaction analysis
 app.all('/api/premarket-news/regenerate', async (req, res) => {
   try {
-    // Force-pull freshest live breaking news from Yahoo Finance & Google News RSS + Gemini translation + live Yahoo quotes
     await refreshLiveRssBreakingNews(true);
 
-    // Ensure quotes are freshly synced across the active feed
     if (Date.now() - lastQuotesEnrichedTime > 5000) {
       cachedPremarketNews = await enrichPremarketNewsWithLiveQuotes(cachedPremarketNews);
       lastQuotesEnrichedTime = Date.now();
@@ -942,14 +1570,15 @@ app.all('/api/premarket-news/regenerate', async (req, res) => {
     res.json({
       pulse,
       news: cachedPremarketNews,
+      todayDateKey: getTodayDateKey(),
       lastUpdated: new Date(lastPremarketNewsGenerated).toISOString(),
       rssSyncedAt: lastRssNewsSyncTime ? new Date(lastRssNewsSyncTime).toISOString() : undefined,
       liveRssCount: cachedPremarketNews.filter((n) => n.isLiveRss).length,
       source: 'live_rss_and_yahoo_quotes',
     });
   } catch (error: any) {
-    console.error('Error regenerating premarket news:', error);
-    res.status(500).json({ error: 'Failed to regenerate premarket news' });
+    console.error('Error regenerating daily news:', error);
+    res.status(500).json({ error: 'Failed to regenerate daily news' });
   }
 });
 
@@ -1026,47 +1655,68 @@ app.post('/api/premarket-analyze', async (req, res) => {
       return;
     }
 
-    const prompt = `You are a Wall Street Senior Portfolio Manager analyzing a piece of breaking pre-market news or an announcement from global financial media:
-"${text.trim()}"
+    const prompt = `You are a practical stock market news analyst explaining in clear, simple Hebrew how a breaking news headline affects a stock and how the market is likely to react.
+Headline/news text: "${text.trim()}"
+${detectedTicker ? `Ticker: ${detectedTicker}` : ''}
 
-Analyze this news thoroughly for an institutional equity investor.
 Return strictly a JSON object with this exact schema:
 {
   "ticker": string (e.g. "NVDA", "AAPL", or "SPY"),
   "companyName": string,
-  "headline": string (polished, engaging headline in Hebrew),
-  "summary": string (succinct 2-sentence summary in Hebrew of what occurred),
-  "source": string (e.g. "Global Wire / Financial Media"),
+  "headline": string (clear, concise headline in Hebrew),
+  "summary": string (2 short sentences in Hebrew explaining what happened),
+  "source": string,
   "category": "MACRO_RATES" | "EARNINGS_CATALYST" | "TECH_AI_CHIPS" | "HEALTHCARE_BIO" | "CONSUMER_RETAIL" | "ANALYST_RATINGS",
-  "sentiment": "BULLISH" | "NEUTRAL" | "BEARISH" | "HIGH_VOLATILITY",
+  "sentiment": "BULLISH" | "NEUTRAL" | "BEARISH",
+  "reactionAnalysis": {
+    "expectedReaction": "POSITIVE_UP" | "NEGATIVE_DOWN" | "MIXED_VOLATILE",
+    "expectedReactionLabelHe": string (e.g. "צפי לתגובה חיובית (עליות)" or "צפי לתגובת לחץ (ירידות)"),
+    "expectedReactionLabelEn": string,
+    "expectedMoveRange": string (e.g. "+3% עד +6%"),
+    "whyReactingHe": string (1-2 clear Hebrew sentences explaining why the stock/market reacts this way),
+    "whyReactingEn": string,
+    "isOverreactionOrRealHe": string (1-2 clear Hebrew sentences: is this short-term noise/overreaction or a real business shift?),
+    "isOverreactionOrRealEn": string,
+    "howToRespondHe": string (1 concrete, plain-Hebrew sentence telling the investor what to do in response),
+    "howToRespondEn": string
+  },
   "recommendation": {
     "action": "STRONG_BUY" | "ACCUMULATE_ON_DIP" | "HOLD_MONITOR" | "CAUTION_ALERT" | "TAKE_PROFIT",
-    "actionLabelHe": string (e.g. "קנייה חזקה בפתיחה", "צבירה בירידות", "החזקה ודריכות", "זהירות - הפחתת סיכון"),
+    "actionLabelHe": string,
     "actionLabelEn": string,
     "confidenceScore": number (80-98),
     "impactOn5YearThesis": "STRENGTHENS_MOAT" | "TEMPORARY_NOISE" | "NEUTRAL" | "THESIS_WATCH",
-    "impactAnalysisHe": string (deep institutional analysis in Hebrew: does this alter the 5-year moat, ROIC, pricing power, or FCF?),
+    "impactAnalysisHe": string,
     "impactAnalysisEn": string,
-    "openingBellGamePlanHe": string (specific concrete instructions in Hebrew for what to do at the 09:30 EST opening bell),
+    "openingBellGamePlanHe": string,
     "openingBellGamePlanEn": string,
     "targetPrice": number,
     "buyZoneMax": number,
-    "riskFactorHe": string (main downside risk in Hebrew),
+    "riskFactorHe": string,
     "riskFactorEn": string
   }
 }`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: 'gemini-4-hydrogen',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
+        thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
       },
     });
 
     const rawText = response.text || '';
     const parsed = safeParseJsonObject(rawText);
     if (parsed) {
+      if (!parsed.reactionAnalysis) {
+        parsed.reactionAnalysis = buildContextualReactionAnalysis({
+          ticker: parsed.ticker || detectedTicker || 'MKT',
+          title: text,
+          source: parsed.source || 'AI News Analysis',
+          sentiment: parsed.sentiment || 'NEUTRAL',
+        });
+      }
       res.json(parsed);
       return;
     }
@@ -1098,31 +1748,6 @@ Return strictly a JSON object with this exact schema:
         riskFactorEn: 'Sensitivity to broader market volatility.'
       }
     });
-  }
-});
-
-// GET /api/daily-earnings - Retrieve scheduled earnings events with live prices and AI teardowns
-app.get('/api/daily-earnings', async (req, res) => {
-  try {
-    const events = getDailyEarningsData();
-    // Hydrate with latest live prices where available
-    const hydrated = events.map((evt) => {
-      const cached = liveQuotesCache.get(evt.ticker);
-      return {
-        ...evt,
-        currentPrice: cached ? cached.quote.price : undefined,
-        changePercent: cached ? cached.quote.changePercent : undefined,
-      };
-    });
-    res.json({
-      success: true,
-      events: hydrated,
-      asOfDate: new Date().toISOString().slice(0, 10),
-      timestamp: Date.now(),
-    });
-  } catch (error: any) {
-    console.error('Error fetching daily earnings:', error);
-    res.status(500).json({ error: 'Failed to retrieve daily earnings schedule' });
   }
 });
 
@@ -2162,14 +2787,28 @@ Return strictly a JSON object adhering to this schema:
 }`;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-4-hydrogen',
         contents: prompt,
-        config: { responseMimeType: 'application/json' },
+        config: {
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
       });
 
       const raw = response.text || '';
       const parsed = safeParseJsonObject(raw);
       if (parsed) {
+        if (!parsed.reactionAnalysis) {
+          parsed.reactionAnalysis = buildContextualReactionAnalysis({
+            ticker: aliased,
+            title: parsed.headline || articlesContext || aliased,
+            source: parsed.source || 'Live News',
+            sentiment: parsed.sentiment || 'NEUTRAL',
+            catalystType: parsed.catalystType,
+            liveChangePercent: liveQuote.changePercent,
+            knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[aliased]?.moatHe,
+          });
+        }
         // Cache and prepend to news
         cachedPremarketNews = [parsed, ...cachedPremarketNews.filter((n) => n.ticker !== aliased)];
         return parsed;
@@ -2234,6 +2873,15 @@ Return strictly a JSON object adhering to this schema:
         riskFactorHe: 'תנודתיות גבוהה סביב כותרות החדשות ותגובת אנליסטים בוול סטריט.',
         riskFactorEn: 'Headline risk and high trading beta around opening bell.',
       },
+      reactionAnalysis: buildContextualReactionAnalysis({
+        ticker: aliased,
+        title: topArticle.title || aliased,
+        source: topArticle.source,
+        sentiment: effectiveSentiment,
+        catalystType: effectiveCatalyst,
+        liveChangePercent: liveQuote.changePercent,
+        knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[aliased]?.moatHe,
+      }),
     };
     cachedPremarketNews = [item, ...cachedPremarketNews.filter((n) => n.ticker !== aliased)];
     return item;
@@ -2283,7 +2931,25 @@ Return strictly a JSON object adhering to this schema:
       riskFactorHe: 'רגישות לתנאי המאקרו ולשינויים בסנטימנט המשקיעים בסקטור.',
       riskFactorEn: 'Macro volatility and sector-wide sentiment shifts.',
     },
+    reactionAnalysis: buildContextualReactionAnalysis({
+      ticker: aliased,
+      title: topArticle?.title || aliased,
+      source: 'Live Wire / Bloomberg',
+      sentiment: isSharpDrop ? 'BEARISH' : isPositive ? 'BULLISH' : 'NEUTRAL',
+      liveChangePercent: liveQuote.changePercent,
+      knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[aliased]?.moatHe,
+    }),
   };
+
+  if (item && !item.reactionAnalysis) {
+    item.reactionAnalysis = buildContextualReactionAnalysis({
+      ticker: aliased,
+      title: item.headline || aliased,
+      source: item.source || 'Live Wire',
+      sentiment: item.sentiment || 'NEUTRAL',
+      liveChangePercent: liveQuote.changePercent,
+    });
+  }
 
   // Prepend to cached feed
   cachedPremarketNews = [item, ...cachedPremarketNews.filter((n) => n.ticker !== aliased)];
@@ -3191,13 +3857,724 @@ function generateFallbackStockAudit(ticker: string, lang: string = 'en', liveQuo
   };
 }
 
-// Fast health-check endpoint for cloud load balancers & free hosting providers
-app.get('/api/health', (_req, res) => {
-  res.json({
-    status: 'ok',
-    uptime: Math.floor(process.uptime()),
-    timestamp: Date.now(),
+// ───────────────────────────────────────────────────────────────────────────
+// SEC EDGAR OFFICIAL QUARTERLY REPORTS & GAAP ANALYSIS ENGINE
+// ───────────────────────────────────────────────────────────────────────────
+const SEC_USER_AGENT = 'MoatGuardPro research@moatguard.app';
+let secTickerMapCache: { map: Record<string, { cik: string; title: string }>; expiresAt: number } | null = null;
+const secQuarterlyCache = new Map<string, { data: any; expiresAt: number }>();
+
+async function getSecTickerMap(): Promise<Record<string, { cik: string; title: string }>> {
+  if (secTickerMapCache && secTickerMapCache.expiresAt > Date.now()) {
+    return secTickerMapCache.map;
+  }
+  const resp = await fetch('https://www.sec.gov/files/company_tickers.json', {
+    headers: { 'User-Agent': SEC_USER_AGENT, Accept: 'application/json' },
+    signal: AbortSignal.timeout(8000),
   });
+  if (!resp.ok) {
+    throw new Error(`SEC ticker registry failed (${resp.status})`);
+  }
+  const raw: any = await resp.json();
+  const map: Record<string, { cik: string; title: string }> = {};
+  for (const key of Object.keys(raw || {})) {
+    const entry = raw[key];
+    if (entry && entry.ticker && entry.cik_str !== undefined) {
+      const paddedCik = String(entry.cik_str).padStart(10, '0');
+      const tUpper = String(entry.ticker).toUpperCase().trim();
+      map[tUpper] = { cik: paddedCik, title: String(entry.title || tUpper) };
+    }
+  }
+  secTickerMapCache = { map, expiresAt: Date.now() + 24 * 60 * 60 * 1000 };
+  return map;
+}
+
+interface XbrlQuarterPoint {
+  end: string;
+  start?: string;
+  val: number;
+  fy?: number;
+  fp?: string;
+  form?: string;
+  filed?: string;
+  accn?: string;
+  frame?: string;
+}
+
+function daysBetween(startStr?: string, endStr?: string): number {
+  if (!startStr || !endStr) return 0;
+  const s = new Date(startStr).getTime();
+  const e = new Date(endStr).getTime();
+  if (isNaN(s) || isNaN(e)) return 0;
+  return Math.round((e - s) / (1000 * 60 * 60 * 24));
+}
+
+function extractStandaloneQuarterPoints(
+  factsRoot: any,
+  tagCandidates: string[],
+  unitType: 'USD' | 'USD/shares' = 'USD'
+): XbrlQuarterPoint[] {
+  const usGaap = factsRoot?.facts?.['us-gaap'] || {};
+  const ifrs = factsRoot?.facts?.['ifrs-full'] || {};
+
+  // Deduplicate exact (start, end) keeping latest filed & highest-priority tag candidate
+  const bySpanKey = new Map<string, XbrlQuarterPoint & { priority: number }>();
+
+  tagCandidates.forEach((tag, tagIdx) => {
+    const tagObj = usGaap[tag] || ifrs[tag];
+    if (!tagObj?.units) return;
+    const unitArr: any[] =
+      unitType === 'USD/shares'
+        ? tagObj.units['USD/shares'] || tagObj.units['USD / shares'] || []
+        : tagObj.units['USD'] || [];
+    if (!Array.isArray(unitArr)) return;
+
+    for (const item of unitArr) {
+      if (typeof item.val !== 'number' || !item.end) continue;
+      if (item.form !== '10-Q' && item.form !== '10-K') continue;
+      const spanKey = `${item.start || ''}|${item.end}`;
+      const existing = bySpanKey.get(spanKey);
+      const isBetter =
+        !existing ||
+        (item.filed || '') > (existing.filed || '') ||
+        ((item.filed || '') === (existing.filed || '') && tagIdx < existing.priority);
+      if (isBetter) {
+        bySpanKey.set(spanKey, {
+          end: item.end,
+          start: item.start,
+          val: item.val,
+          fy: item.fy,
+          fp: item.fp,
+          form: item.form,
+          filed: item.filed,
+          accn: item.accn,
+          frame: item.frame,
+          priority: tagIdx,
+        });
+      }
+    }
+  });
+
+  const allPoints = Array.from(bySpanKey.values());
+  const standaloneByEnd = new Map<string, XbrlQuarterPoint>();
+
+  // 1. Direct standalone 3-month entries (~70-115 days duration)
+  for (const pt of allPoints) {
+    const dur = daysBetween(pt.start, pt.end);
+    const isStandaloneQFrame = typeof pt.frame === 'string' && /^CY\d{4}Q[1-4]$/.test(pt.frame);
+    if ((dur >= 70 && dur <= 115) || isStandaloneQFrame) {
+      const existing = standaloneByEnd.get(pt.end);
+      if (
+        !existing ||
+        (pt.filed || '') > (existing.filed || '')
+      ) {
+        standaloneByEnd.set(pt.end, pt);
+      }
+    }
+  }
+
+  // 2. Group cumulative YTD series by fiscal year start date so we derive Q2 = 6M - 3M, Q3 = 9M - 6M, Q4 = 12M - 9M
+  const ytdByStart = new Map<string, XbrlQuarterPoint[]>();
+  for (const pt of allPoints) {
+    if (!pt.start) continue;
+    const dur = daysBetween(pt.start, pt.end);
+    if (dur >= 70 && dur <= 390) {
+      const arr = ytdByStart.get(pt.start) || [];
+      arr.push(pt);
+      ytdByStart.set(pt.start, arr);
+    }
+  }
+
+  for (const [, pts] of ytdByStart.entries()) {
+    // Sort chronologically ascending by end date (3M -> 6M -> 9M -> 12M)
+    const sortedAsc = [...pts].sort((a, b) => a.end.localeCompare(b.end));
+    for (let i = 0; i < sortedAsc.length; i++) {
+      const curr = sortedAsc[i];
+      if (standaloneByEnd.has(curr.end)) continue;
+
+      const durCurr = daysBetween(curr.start, curr.end);
+      if (durCurr >= 70 && durCurr <= 115) {
+        standaloneByEnd.set(curr.end, curr);
+        continue;
+      }
+
+      // Find immediate preceding cumulative period in same fiscal year (~90 days shorter)
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = sortedAsc[j];
+        const durPrev = daysBetween(prev.start, prev.end);
+        const stepDays = durCurr - durPrev;
+        if (stepDays >= 70 && stepDays <= 115) {
+          standaloneByEnd.set(curr.end, {
+            ...curr,
+            val: Number((curr.val - prev.val).toFixed(2)),
+          });
+          break;
+        }
+      }
+    }
+  }
+
+  // 3. Extra fallback for Q4 via FY Total - (Q1 + Q2 + Q3) when fiscal starts shifted slightly across years
+  const annualByFy = new Map<number, XbrlQuarterPoint>();
+  const qByFy = new Map<number, Map<string, XbrlQuarterPoint>>();
+  for (const pt of allPoints) {
+    const dur = daysBetween(pt.start, pt.end);
+    if (dur >= 340 && dur <= 385 && pt.form === '10-K' && pt.fy) {
+      const existingFy = annualByFy.get(pt.fy);
+      if (!existingFy || (pt.filed || '') > (existingFy.filed || '')) {
+        annualByFy.set(pt.fy, pt);
+      }
+    }
+  }
+  for (const pt of standaloneByEnd.values()) {
+    if (pt.fy && pt.fp && ['Q1', 'Q2', 'Q3'].includes(pt.fp)) {
+      const m = qByFy.get(pt.fy) || new Map<string, XbrlQuarterPoint>();
+      m.set(pt.fp, pt);
+      qByFy.set(pt.fy, m);
+    }
+  }
+  for (const [fy, annualPt] of annualByFy.entries()) {
+    if (standaloneByEnd.has(annualPt.end)) continue;
+    const m = qByFy.get(fy);
+    if (m && m.size === 3) {
+      const sum3 = Array.from(m.values()).reduce((acc, p) => acc + p.val, 0);
+      standaloneByEnd.set(annualPt.end, {
+        end: annualPt.end,
+        val: Number((annualPt.val - sum3).toFixed(2)),
+        fy,
+        fp: 'Q4',
+        form: '10-K',
+        filed: annualPt.filed,
+        accn: annualPt.accn,
+      });
+    }
+  }
+
+  return Array.from(standaloneByEnd.values()).sort((a, b) => b.end.localeCompare(a.end));
+}
+
+function extractInstantPointNearDate(
+  factsRoot: any,
+  tagCandidates: string[],
+  targetEnd: string
+): number | null {
+  const usGaap = factsRoot?.facts?.['us-gaap'] || {};
+  const ifrs = factsRoot?.facts?.['ifrs-full'] || {};
+
+  for (const tag of tagCandidates) {
+    const tagObj = usGaap[tag] || ifrs[tag];
+    const usdArr: any[] = tagObj?.units?.['USD'] || [];
+    if (!Array.isArray(usdArr) || usdArr.length === 0) continue;
+
+    // Exact match on end date first
+    const matches = usdArr.filter((x) => x.end === targetEnd && typeof x.val === 'number');
+    if (matches.length > 0) {
+      matches.sort((a, b) => String(b.filed || '').localeCompare(String(a.filed || '')));
+      return matches[0].val;
+    }
+  }
+  return null;
+}
+
+async function fetchSecQuarterlyReports(rawTicker: string) {
+  const cleanUpper = rawTicker.toUpperCase().trim();
+  const normalized = SERVER_TICKER_ALIASES[cleanUpper] || cleanUpper;
+  const cached = secQuarterlyCache.get(normalized);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+
+  const tickerMap = await getSecTickerMap();
+  const aliases = [
+    normalized,
+    normalized.replace(/\./g, '-'),
+    normalized.replace(/-/g, '.'),
+  ];
+  let matched: { cik: string; title: string } | null = null;
+  for (const a of aliases) {
+    if (tickerMap[a]) {
+      matched = tickerMap[a];
+      break;
+    }
+  }
+  if (!matched) {
+    throw new Error(`Ticker "${normalized}" was not found in SEC EDGAR public company registry.`);
+  }
+
+  const cikNum = String(Number(matched.cik));
+  const [subResp, factsResp] = await Promise.all([
+    fetch(`https://data.sec.gov/submissions/CIK${matched.cik}.json`, {
+      headers: { 'User-Agent': SEC_USER_AGENT, Accept: 'application/json' },
+      signal: AbortSignal.timeout(10000),
+    }),
+    fetch(`https://data.sec.gov/api/xbrl/companyfacts/CIK${matched.cik}.json`, {
+      headers: { 'User-Agent': SEC_USER_AGENT, Accept: 'application/json' },
+      signal: AbortSignal.timeout(12000),
+    }),
+  ]);
+
+  if (!subResp.ok) {
+    throw new Error(`SEC submissions request failed (${subResp.status})`);
+  }
+  if (!factsResp.ok) {
+    throw new Error(`SEC XBRL companyfacts request failed (${factsResp.status})`);
+  }
+
+  const subJson: any = await subResp.json();
+  const factsJson: any = await factsResp.json();
+
+  // Build official recent 10-Q, 10-K, 8-K filings list
+  const recent = subJson?.filings?.recent || {};
+  const forms: string[] = recent.form || [];
+  const filingDates: string[] = recent.filingDate || [];
+  const reportDates: string[] = recent.reportDate || [];
+  const accessionNumbers: string[] = recent.accessionNumber || [];
+  const primaryDocuments: string[] = recent.primaryDocument || [];
+  const primaryDescriptions: string[] = recent.primaryDocDescription || [];
+
+  const officialFilings: any[] = [];
+  for (let i = 0; i < forms.length && officialFilings.length < 24; i++) {
+    const f = forms[i];
+    if (f === '10-Q' || f === '10-K' || f === '8-K') {
+      const acc = accessionNumbers[i] || '';
+      const accNoDashes = acc.replace(/-/g, '');
+      const doc = primaryDocuments[i] || '';
+      const secUrl = accNoDashes && doc
+        ? `https://www.sec.gov/Archives/edgar/data/${cikNum}/${accNoDashes}/${doc}`
+        : `https://www.sec.gov/edgar/browse/?CIK=${matched.cik}`;
+      officialFilings.push({
+        form: f,
+        filingDate: filingDates[i] || '',
+        reportDate: reportDates[i] || filingDates[i] || '',
+        accessionNumber: acc,
+        description: primaryDescriptions[i] || f,
+        secUrl,
+      });
+    }
+  }
+
+  // Extract core financial series from SEC XBRL
+  const revSeries = extractStandaloneQuarterPoints(factsJson, [
+    'RevenueFromContractWithCustomerExcludingAssessedTax',
+    'Revenues',
+    'SalesRevenueNet',
+    'RevenueFromContractWithCustomerIncludingAssessedTax',
+    'SalesRevenueServicesNet',
+    'RevenuesNetOfInterestExpense',
+    'InterestAndDividendIncomeOperating',
+  ]);
+  const grossSeries = extractStandaloneQuarterPoints(factsJson, ['GrossProfit']);
+  const costRevSeries = extractStandaloneQuarterPoints(factsJson, [
+    'CostOfRevenue',
+    'CostOfGoodsAndServicesSold',
+    'CostOfGoodsSold',
+  ]);
+  const opIncSeries = extractStandaloneQuarterPoints(factsJson, [
+    'OperatingIncomeLoss',
+    'IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
+  ]);
+  const netIncSeries = extractStandaloneQuarterPoints(factsJson, ['NetIncomeLoss', 'ProfitLoss']);
+  const epsSeries = extractStandaloneQuarterPoints(
+    factsJson,
+    ['EarningsPerShareDiluted', 'EarningsPerShareBasic'],
+    'USD/shares'
+  );
+  const ocfSeries = extractStandaloneQuarterPoints(factsJson, [
+    'NetCashProvidedByUsedInOperatingActivities',
+    'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+  ]);
+  const capexSeries = extractStandaloneQuarterPoints(factsJson, [
+    'PaymentsToAcquirePropertyPlantAndEquipment',
+    'PaymentsToAcquireProductiveAssets',
+    'PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets',
+    'CapitalExpendituresIncurredButNotYetPaid',
+  ]);
+
+  const toEndMap = (arr: XbrlQuarterPoint[]) => {
+    const m = new Map<string, XbrlQuarterPoint>();
+    for (const p of arr) m.set(p.end, p);
+    return m;
+  };
+  const grossMap = toEndMap(grossSeries);
+  const costMap = toEndMap(costRevSeries);
+  const opMap = toEndMap(opIncSeries);
+  const netMap = toEndMap(netIncSeries);
+  const epsMap = toEndMap(epsSeries);
+  const ocfMap = toEndMap(ocfSeries);
+  const capexMap = toEndMap(capexSeries);
+
+  // Merge unique quarter end dates from Revenue + Operating/Net Income (up to 12 most recent)
+  const dateSet = new Set<string>();
+  revSeries.slice(0, 14).forEach((p) => dateSet.add(p.end));
+  netIncSeries.slice(0, 14).forEach((p) => dateSet.add(p.end));
+  const sortedDates = Array.from(dateSet).sort((a, b) => b.localeCompare(a)).slice(0, 10);
+  const revMap = toEndMap(revSeries);
+
+  const rawQuarters = sortedDates.map((endDate) => {
+    const rPt = revMap.get(endDate);
+    const nPt = netMap.get(endDate);
+    const gPt = grossMap.get(endDate);
+    const cPt = costMap.get(endDate);
+    const oPt = opMap.get(endDate);
+    const ePt = epsMap.get(endDate);
+    const ocfPt = ocfMap.get(endDate);
+    const capexPt = capexMap.get(endDate);
+
+    const revenue = rPt?.val ?? null;
+    const grossProfit = gPt?.val ?? (revenue !== null && cPt ? revenue - cPt.val : null);
+    const operatingIncome = oPt?.val ?? null;
+    const netIncome = nPt?.val ?? null;
+    const epsDiluted = ePt?.val ?? null;
+    const operatingCashFlow = ocfPt?.val ?? null;
+    const capex = capexPt ? Math.abs(capexPt.val) : null;
+    const freeCashFlow =
+      operatingCashFlow !== null && capex !== null
+        ? operatingCashFlow - capex
+        : operatingCashFlow;
+
+    // Balance sheet at quarter end (Cash + Total Debt)
+    const cash = extractInstantPointNearDate(
+      factsJson,
+      [
+        'CashAndCashEquivalentsAtCarryingValue',
+        'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents',
+        'CashAndShortTermInvestments',
+      ],
+      endDate
+    );
+    const ltDebt =
+      extractInstantPointNearDate(
+        factsJson,
+        ['LongTermDebtNoncurrent', 'LongTermDebt'],
+        endDate
+      ) || 0;
+    const stDebt =
+      extractInstantPointNearDate(
+        factsJson,
+        ['LongTermDebtCurrent', 'DebtCurrent', 'ShortTermBorrowings'],
+        endDate
+      ) || 0;
+    const totalDebtRaw = extractInstantPointNearDate(
+      factsJson,
+      ['DebtAndCapitalLeaseObligations', 'LongTermDebtAndCapitalLeaseObligations'],
+      endDate
+    );
+    const totalDebt = totalDebtRaw !== null ? totalDebtRaw : (ltDebt + stDebt > 0 ? ltDebt + stDebt : null);
+    const netDebt = totalDebt !== null && cash !== null ? totalDebt - cash : null;
+
+    // Margins & Ratios
+    const grossMarginPct = revenue && grossProfit !== null ? Number(((grossProfit / revenue) * 100).toFixed(1)) : null;
+    const operatingMarginPct = revenue && operatingIncome !== null ? Number(((operatingIncome / revenue) * 100).toFixed(1)) : null;
+    const netMarginPct = revenue && netIncome !== null ? Number(((netIncome / revenue) * 100).toFixed(1)) : null;
+    const fcfMarginPct = revenue && freeCashFlow !== null ? Number(((freeCashFlow / revenue) * 100).toFixed(1)) : null;
+    const capexPctRevenue = revenue && capex !== null ? Number(((capex / revenue) * 100).toFixed(1)) : null;
+    const fcfConversionPct =
+      netIncome && netIncome > 0 && freeCashFlow !== null
+        ? Number(((freeCashFlow / netIncome) * 100).toFixed(0))
+        : null;
+
+    const refPt = rPt || nPt;
+    const endDt = new Date(endDate);
+    const calQ = Math.floor(endDt.getUTCMonth() / 3) + 1;
+    const normalizedFp = refPt?.fp === 'FY' ? 'Q4' : refPt?.fp;
+    const quarterLabel = normalizedFp && refPt?.fy
+      ? `${normalizedFp} FY${refPt.fy}`
+      : `Q${calQ} ${endDt.getUTCFullYear()}`;
+
+    // Find closest matching official filing (10-Q or 10-K)
+    const matchingFiling =
+      officialFilings.find((f) => (f.form === '10-Q' || f.form === '10-K') && f.reportDate === endDate) ||
+      officialFilings.find((f) => {
+        if (f.form !== '10-Q' && f.form !== '10-K') return false;
+        const diff = Math.abs(new Date(f.reportDate).getTime() - endDt.getTime());
+        return diff <= 15 * 24 * 60 * 60 * 1000;
+      });
+
+    return {
+      endDate,
+      quarterLabel,
+      form: matchingFiling?.form || refPt?.form || '10-Q',
+      filingDate: matchingFiling?.filingDate || refPt?.filed || '',
+      secUrl: matchingFiling?.secUrl || `https://www.sec.gov/edgar/browse/?CIK=${matched!.cik}`,
+      revenue,
+      grossProfit,
+      operatingIncome,
+      netIncome,
+      epsDiluted,
+      operatingCashFlow,
+      capex,
+      freeCashFlow,
+      cash,
+      totalDebt,
+      netDebt,
+      grossMarginPct,
+      operatingMarginPct,
+      netMarginPct,
+      fcfMarginPct,
+      capexPctRevenue,
+      fcfConversionPct,
+    };
+  });
+
+  // Compute YoY Growth for each quarter vs 4 quarters prior (index + 4 or closest ~365 days prior)
+  const quarters = rawQuarters.slice(0, 8).map((q, idx) => {
+    const targetMs = new Date(q.endDate).getTime() - 365 * 24 * 60 * 60 * 1000;
+    const priorYearQ = rawQuarters.find((cand) => {
+      const diffDays = Math.abs(new Date(cand.endDate).getTime() - targetMs) / (1000 * 60 * 60 * 24);
+      return diffDays <= 40;
+    });
+
+    const calcPct = (curr: number | null, prev: number | null) => {
+      if (curr === null || prev === null || prev === 0) return null;
+      return Number((((curr - prev) / Math.abs(prev)) * 100).toFixed(1));
+    };
+
+    return {
+      ...q,
+      revenueYoY: priorYearQ ? calcPct(q.revenue, priorYearQ.revenue) : null,
+      epsYoY: priorYearQ ? calcPct(q.epsDiluted, priorYearQ.epsDiluted) : null,
+      fcfYoY: priorYearQ ? calcPct(q.freeCashFlow, priorYearQ.freeCashFlow) : null,
+      opMarginYoYDelta:
+        typeof q.operatingMarginPct === 'number' && typeof priorYearQ?.operatingMarginPct === 'number'
+          ? Number((q.operatingMarginPct - priorYearQ.operatingMarginPct).toFixed(1))
+          : null,
+    };
+  });
+
+  const latest = quarters[0];
+  const latestChecks = latest
+    ? {
+        revenueGrowing: latest.revenueYoY !== null ? latest.revenueYoY > 0 : (latest.revenue || 0) > 0,
+        epsRising: latest.epsYoY !== null ? latest.epsYoY > 0 : (latest.epsDiluted || 0) > 0,
+        marginsHealthyOrExpanding:
+          (latest.opMarginYoYDelta !== null && latest.opMarginYoYDelta >= -0.5) ||
+          (latest.operatingMarginPct !== null && latest.operatingMarginPct >= 15),
+        fcfPositive: (latest.freeCashFlow ?? 0) > 0,
+        debtControlled:
+          latest.netDebt !== null
+            ? latest.netDebt <= 0 ||
+              (latest.operatingIncome && latest.operatingIncome > 0
+                ? latest.netDebt / (latest.operatingIncome * 4) < 3.0
+                : true)
+            : true,
+      }
+    : null;
+
+  const result = {
+    ticker: normalized,
+    cik: matched.cik,
+    entityName: subJson?.name || matched.title,
+    sicDescription: subJson?.sicDescription || '',
+    exchanges: Array.isArray(subJson?.exchanges) ? subJson.exchanges : [],
+    filings: officialFilings.slice(0, 12),
+    quarters,
+    latestChecks,
+    source: 'SEC_EDGAR_LIVE',
+    fetchedAt: new Date().toISOString(),
+  };
+
+  secQuarterlyCache.set(normalized, { data: result, expiresAt: Date.now() + 15 * 60 * 1000 });
+  return result;
+}
+
+app.get('/api/sec-quarterly-reports', async (req, res) => {
+  try {
+    const ticker = String(req.query.ticker || 'NVDA').trim().toUpperCase();
+    if (!ticker) {
+      res.status(400).json({ error: 'Ticker parameter is required' });
+      return;
+    }
+    const data = await fetchSecQuarterlyReports(ticker);
+    res.json(data);
+  } catch (err: any) {
+    console.error('SEC quarterly fetch error:', err?.message || err);
+    res.status(502).json({ error: err?.message || 'Failed to fetch SEC EDGAR quarterly report' });
+  }
+});
+
+app.post('/api/sec-quarterly-reports/analyze', async (req, res) => {
+  try {
+    const { ticker, endDate, lang = 'he' } = req.body || {};
+    if (!ticker) {
+      res.status(400).json({ error: 'ticker is required' });
+      return;
+    }
+
+    const secData = await fetchSecQuarterlyReports(String(ticker));
+    const targetQ =
+      (endDate ? secData.quarters.find((q: any) => q.endDate === endDate) : secData.quarters[0]) ||
+      secData.quarters[0];
+
+    if (!targetQ) {
+      res.status(404).json({ error: 'No audited quarterly XBRL data found for this ticker in SEC EDGAR.' });
+      return;
+    }
+
+    const fmtUsd = (val: number | null) => {
+      if (val === null || isNaN(val)) return 'לא דווח';
+      const abs = Math.abs(val);
+      const sign = val < 0 ? '-' : '';
+      if (abs >= 1e9) return `${sign}$${(abs / 1e9).toFixed(2)}B`;
+      if (abs >= 1e6) return `${sign}$${(abs / 1e6).toFixed(1)}M`;
+      return `${sign}$${abs.toLocaleString()}`;
+    };
+
+    const isHe = lang === 'he';
+
+    // Deterministic high-accuracy fallback based on real SEC numbers
+    const deterministicScore = (() => {
+      let s = 68;
+      if ((targetQ.revenueYoY ?? 0) > 8) s += 8;
+      if ((targetQ.epsYoY ?? 0) > 10) s += 8;
+      if ((targetQ.operatingMarginPct ?? 0) >= 20) s += 6;
+      if ((targetQ.freeCashFlow ?? 0) > 0) s += 5;
+      if (targetQ.netDebt !== null && targetQ.netDebt <= 0) s += 5;
+      return Math.min(98, Math.max(40, s));
+    })();
+
+    const deterministicAnalysis = {
+      quarterLabel: targetQ.quarterLabel,
+      endDate: targetQ.endDate,
+      score: deterministicScore,
+      headline: isHe
+        ? `ניתוח דוח ${targetQ.quarterLabel} (${secData.entityName}): הכנסות של ${fmtUsd(targetQ.revenue)} ורווח למניה $${targetQ.epsDiluted ?? '—'}`
+        : `${targetQ.quarterLabel} Report Analysis (${secData.entityName}): Revenue ${fmtUsd(targetQ.revenue)}, EPS $${targetQ.epsDiluted ?? '—'}`,
+      executiveSummary: isHe
+        ? `החברה דיווחה בדוח ${targetQ.form} לרבעון ${targetQ.quarterLabel} הכנסות של ${fmtUsd(targetQ.revenue)}${targetQ.revenueYoY !== null ? ` (${targetQ.revenueYoY >= 0 ? '+' : ''}${targetQ.revenueYoY}% משנה שעברה)` : ''}, רווח תפעולי של ${fmtUsd(targetQ.operatingIncome)} (${targetQ.operatingMarginPct ?? '—'}% שוליים), ותזרים מזומנים חופשי (FCF) של ${fmtUsd(targetQ.freeCashFlow)}.`
+        : `Reported ${targetQ.quarterLabel} revenue of ${fmtUsd(targetQ.revenue)} with operating margin of ${targetQ.operatingMarginPct ?? '—'}% and Free Cash Flow of ${fmtUsd(targetQ.freeCashFlow)}.`,
+      profitabilityAndMargins: isHe
+        ? `שולי רווח גולמי: ${targetQ.grossMarginPct ?? '—'}% | שולי רווח תפעולי: ${targetQ.operatingMarginPct ?? '—'}%${targetQ.opMarginYoYDelta !== null ? ` (שינוי שנתי: ${targetQ.opMarginYoYDelta >= 0 ? '+' : ''}${targetQ.opMarginYoYDelta} נק' אחוז)` : ''} | רווח למניה (EPS): $${targetQ.epsDiluted ?? '—'}${targetQ.epsYoY !== null ? ` (${targetQ.epsYoY >= 0 ? '+' : ''}${targetQ.epsYoY}% YoY)` : ''}.`
+        : `Gross margin ${targetQ.grossMarginPct ?? '—'}%, Operating margin ${targetQ.operatingMarginPct ?? '—'}%, EPS $${targetQ.epsDiluted ?? '—'}.`,
+      capexAndFcfAnalysis: isHe
+        ? `החברה ייצרה תזרים תפעולי (OCF) של ${fmtUsd(targetQ.operatingCashFlow)} והשקיעה ${fmtUsd(targetQ.capex)} בהוצאות הון (CapEx — כ-${targetQ.capexPctRevenue ?? '—'}% מההכנסות). התזרים החופשי (FCF) שנותר עומד על ${fmtUsd(targetQ.freeCashFlow)} (${targetQ.fcfMarginPct ?? '—'}% מההכנסות${targetQ.fcfConversionPct !== null ? `, המרת רווח לתזרים של ${targetQ.fcfConversionPct}%` : ''}).`
+        : `Operating cash flow of ${fmtUsd(targetQ.operatingCashFlow)} minus CapEx of ${fmtUsd(targetQ.capex)} (${targetQ.capexPctRevenue ?? '—'}% of rev) produced ${fmtUsd(targetQ.freeCashFlow)} FCF.`,
+      debtAndBalanceSheet: isHe
+        ? `בקופת החברה מזומנים ושווי מזומנים בסך ${fmtUsd(targetQ.cash)} מול סך חוב של ${fmtUsd(targetQ.totalDebt)}. מצב נטו: ${targetQ.netDebt !== null ? (targetQ.netDebt <= 0 ? `עודף מזומנים נטו של ${fmtUsd(Math.abs(targetQ.netDebt))}` : `חוב נטו של ${fmtUsd(targetQ.netDebt)}`) : 'לא דווח במלואו בדוח זה'}.`
+        : `Cash of ${fmtUsd(targetQ.cash)} vs Total Debt of ${fmtUsd(targetQ.totalDebt)}.`,
+      bullPoints: isHe
+        ? [
+            (targetQ.revenueYoY ?? 0) > 0
+              ? `צמיחת הכנסות של ${targetQ.revenueYoY}% משנה שעברה`
+              : `היקף הכנסות רבעוני יציב של ${fmtUsd(targetQ.revenue)}`,
+            (targetQ.freeCashFlow ?? 0) > 0
+              ? `ייצור מזומנים חופשי חיובי (${fmtUsd(targetQ.freeCashFlow)}) לאחר כיסוי מלוא ה-CapEx`
+              : `השקעות הון (CapEx) לצמיחה בהיקף ${fmtUsd(targetQ.capex)}`,
+            targetQ.netDebt !== null && targetQ.netDebt <= 0
+              ? 'מאזן שמרני עם עודף מזומנים נטו על פני החוב'
+              : `שולי רווח תפעוליים של ${targetQ.operatingMarginPct ?? '—'}%`,
+          ]
+        : ['Audited SEC 10-Q figures', 'Consistent cash generation', 'Balance sheet resilience'],
+      watchRisks: isHe
+        ? [
+            (targetQ.opMarginYoYDelta ?? 0) < 0
+              ? `שחיקה קלה של ${Math.abs(targetQ.opMarginYoYDelta!)} נק׳ אחוז במרווח התפעולי משנה שעברה`
+              : 'מעקב אחר קצב הצמיחה ברבעונים הבאים מול תחזיות השוק',
+            (targetQ.capexPctRevenue ?? 0) > 15
+              ? `עצימות CapEx גבוהה (${targetQ.capexPctRevenue}% מההכנסות) דורשת מעקב אחר תשואת ההשקעה (ROIC)`
+              : 'מעקב אחר משמעת הוצאות תפעוליות וניהול החוב',
+          ]
+        : ['Monitor forward guidance and CapEx efficiency'],
+      investorVerdict: isHe
+        ? (targetQ.epsYoY ?? 0) > 0 && (targetQ.freeCashFlow ?? 0) > 0
+          ? 'דוח חזק: רווחיות עולה, תזרים חופשי חיובי אחרי CapEx ואיתנות מאזנית תומכים בהמשך החזקה.'
+          : 'דוח מעורב/מאוזן: מומלץ לעקוב אחר מגמת השוליים והמינוף בדוח הבא.'
+        : 'Solid SEC-audited execution across cash flow and profitability.',
+      source: 'SEC_EDGAR_QUANT',
+    };
+
+    const ai = getAI();
+    if (!ai) {
+      res.json(deterministicAnalysis);
+      return;
+    }
+
+    const recentContext = secData.quarters.slice(0, 4).map((q: any) => ({
+      quarter: q.quarterLabel,
+      endDate: q.endDate,
+      revenue: fmtUsd(q.revenue),
+      revenueYoY: q.revenueYoY !== null ? `${q.revenueYoY}%` : 'N/A',
+      grossMarginPct: q.grossMarginPct,
+      operatingMarginPct: q.operatingMarginPct,
+      netMarginPct: q.netMarginPct,
+      epsDiluted: q.epsDiluted,
+      epsYoY: q.epsYoY !== null ? `${q.epsYoY}%` : 'N/A',
+      operatingCashFlow: fmtUsd(q.operatingCashFlow),
+      capex: fmtUsd(q.capex),
+      capexPctRevenue: q.capexPctRevenue,
+      freeCashFlow: fmtUsd(q.freeCashFlow),
+      fcfMarginPct: q.fcfMarginPct,
+      cash: fmtUsd(q.cash),
+      totalDebt: fmtUsd(q.totalDebt),
+      netDebt: fmtUsd(q.netDebt),
+    }));
+
+    const aiPrompt = `You are a senior Wall Street institutional equity analyst reviewing the official SEC EDGAR filing (${targetQ.form}, period ending ${targetQ.endDate}) for ${secData.entityName} (${secData.ticker}).
+Use ONLY the exact audited SEC XBRL financial data provided below (do not invent any metrics). Compare the target quarter (${targetQ.quarterLabel}) with prior quarters.
+
+Audited SEC EDGAR Quarters:
+${JSON.stringify(recentContext, null, 2)}
+
+Target Quarter: ${targetQ.quarterLabel} (${targetQ.endDate})
+
+Write the full quarterly report analysis in ${isHe ? 'clear, sharp, fluent HEBREW (עברית), keeping terms like EPS, FCF, CapEx, YoY, Margin in standard notation' : 'clear professional English'}.
+Specifically analyze:
+1. Rising/falling earnings (EPS YoY & Revenue YoY)
+2. Margins trend (Gross Margin, Operating Margin, Net Margin)
+3. CapEx vs Operating Cash Flow & Free Cash Flow (FCF) quality
+4. Debt & Liquidity (Cash vs Total Debt & Net Debt)
+
+Return ONLY valid JSON:
+{
+  "headline": string,
+  "executiveSummary": string,
+  "profitabilityAndMargins": string,
+  "capexAndFcfAnalysis": string,
+  "debtAndBalanceSheet": string,
+  "bullPoints": string[],
+  "watchRisks": string[],
+  "investorVerdict": string,
+  "score": number (0-100)
+}`;
+
+    try {
+      const aiRes: any = await Promise.race([
+        ai.models.generateContent({
+          model: 'gemini-2.5-flash',
+          contents: aiPrompt,
+          config: { responseMimeType: 'application/json' },
+        }),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 9500)),
+      ]);
+
+      if (aiRes?.text) {
+        const parsed = safeParseJsonObject<any>(aiRes.text);
+        if (parsed && parsed.executiveSummary) {
+          res.json({
+            quarterLabel: targetQ.quarterLabel,
+            endDate: targetQ.endDate,
+            score: typeof parsed.score === 'number' ? parsed.score : deterministicScore,
+            headline: parsed.headline || deterministicAnalysis.headline,
+            executiveSummary: parsed.executiveSummary,
+            profitabilityAndMargins: parsed.profitabilityAndMargins || deterministicAnalysis.profitabilityAndMargins,
+            capexAndFcfAnalysis: parsed.capexAndFcfAnalysis || deterministicAnalysis.capexAndFcfAnalysis,
+            debtAndBalanceSheet: parsed.debtAndBalanceSheet || deterministicAnalysis.debtAndBalanceSheet,
+            bullPoints: Array.isArray(parsed.bullPoints) ? parsed.bullPoints : deterministicAnalysis.bullPoints,
+            watchRisks: Array.isArray(parsed.watchRisks) ? parsed.watchRisks : deterministicAnalysis.watchRisks,
+            investorVerdict: parsed.investorVerdict || deterministicAnalysis.investorVerdict,
+            source: 'SEC_EDGAR_AND_GEMINI_AI',
+          });
+          return;
+        }
+      }
+    } catch (aiErr) {
+      recordGeminiError(aiErr);
+    }
+
+    res.json(deterministicAnalysis);
+  } catch (err: any) {
+    console.error('Analyze SEC quarterly report error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to analyze quarterly report' });
+  }
 });
 
 // Ensure ALL unhandled /api/* requests return JSON and NEVER fall through to Vite SPA HTML
