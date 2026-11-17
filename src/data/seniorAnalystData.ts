@@ -804,9 +804,28 @@ export function getSeniorAnalystData(
   let rawReports = KNOWN_SENIOR_ANALYST_COVERAGE[ticker];
   if (!rawReports || rawReports.length === 0) {
     rawReports = generateDynamicSeniorAnalystReports(stock, currentPrice);
+  } else {
+    // If live price has moved significantly past a 2025 curated Buy-consensus target anchor,
+    // keep each analyst's relative target spread and rating upside consistent with today's price
+    const rawMeanTarget = rawReports.reduce((sum, r) => sum + r.priceTarget, 0) / rawReports.length;
+    const buyMajority = rawReports.filter((r) => r.rating !== 'Neutral' && r.rating !== 'Hold' && r.rating !== 'Sell' && r.rating !== 'Underweight').length >= rawReports.length * 0.6;
+    if (buyMajority && currentPrice > rawMeanTarget * 1.04) {
+      const parsedAvgTarget = parseFloat((stock.analysts?.averagePriceTarget?.value || '').replace(/[^0-9.]/g, ''));
+      const anchorTarget =
+        !isNaN(parsedAvgTarget) && parsedAvgTarget > currentPrice * 1.05
+          ? parsedAvgTarget
+          : currentPrice * 1.18;
+      const ratio = anchorTarget / Math.max(1, rawMeanTarget);
+      rawReports = rawReports.map((rep) => ({
+        ...rep,
+        priceTarget: Math.round(rep.priceTarget * ratio * 10) / 10,
+        bullCaseTarget: rep.bullCaseTarget ? Math.round(rep.bullCaseTarget * ratio) : undefined,
+        bearCaseTarget: rep.bearCaseTarget ? Math.round(rep.bearCaseTarget * ratio) : undefined,
+      }));
+    }
   }
 
-  // Recalculate implied upside based on active currentPrice if live price differs
+  // Recalculate implied upside based on active currentPrice
   const reports: SeniorAnalystReport[] = rawReports.map((rep) => {
     const implied = currentPrice > 0 ? Math.round(((rep.priceTarget - currentPrice) / currentPrice) * 1000) / 10 : rep.impliedUpsidePercent;
     return {

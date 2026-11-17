@@ -8,6 +8,7 @@ import { StockLogoBadge } from './StockLogoBadge';
 import { StockLiveChart } from './StockLiveChart';
 import { ShareStockReportModal } from './ShareStockReportModal';
 import { CompanyProfileSection } from './CompanyProfileSection';
+import { SeniorAnalystRankings } from './SeniorAnalystRankings';
 import {
   openWhatsAppShare,
   openEmailShare,
@@ -412,6 +413,16 @@ export const LiveTickerAnalyzer: React.FC<LiveTickerAnalyzerProps> = ({
             </span>
             <p className="text-xs text-slate-300 leading-relaxed">{localizedResult.investmentThesisSummary}</p>
           </div>
+
+          {/* Wall Street Analysts Clear Consensus & Price Targets */}
+          {resultStock && (
+            <SeniorAnalystRankings
+              stock={resultStock}
+              livePrice={currentPriceNum}
+              currentLang={currentLang}
+              intrinsicFairValue={fairValue}
+            />
+          )}
         </div>
       )}
 

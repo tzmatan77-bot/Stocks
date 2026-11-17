@@ -647,36 +647,35 @@ export const DeepDiveTop5: React.FC<DeepDiveTop5Props> = ({
           </div>
         </div>
 
-        {/* 7. Analyst Expectations & Gap Analysis (5%) */}
-        <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-5 space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-cyan-400 font-bold text-sm">
-              <Users className="w-4 h-4" />
-              <span>{isHe ? '7. קונצנזוס אנליסטים ופער ציפיות (משקל 5%)' : '7. Analyst Consensus & Expectations Gap (5%)'}</span>
+        {/* 7. Analyst Expectations & Gap Analysis (5%) - Full Width for Clear Readability */}
+        <div className="lg:col-span-2 bg-slate-900/80 border border-slate-800 rounded-xl p-5 sm:p-6 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-cyan-400 font-bold text-sm sm:text-base">
+              <Users className="w-4 h-4 shrink-0" />
+              <span>{isHe ? '7. אנליסטים, קונצנזוס וול סטריט ופער ציפיות (משקל 5%)' : '7. Analyst Consensus & Expectations Gap (5%)'}</span>
             </div>
-            <span className="text-xs font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+            <span className="text-xs font-mono px-2.5 py-1 rounded-lg bg-slate-800 text-cyan-300 border border-slate-700 self-start sm:self-auto">
               {currentStock.analysts.consensus} ({currentStock.analysts.analystCoverageCount} {isHe ? 'אנליסטים' : 'analysts'})
             </span>
           </div>
 
-          <div className="grid grid-cols-2 gap-2 text-xs font-mono">
-            <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
-              <span className="text-slate-400">{isHe ? 'יעד ממוצע / אפסייד:' : 'Avg Target / Upside:'}</span>
-              <div className="text-xs font-bold text-emerald-400 mt-0.5">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono">
+              <span className="text-slate-400 block">{isHe ? 'יעד ממוצע / אפסייד:' : 'Avg Target / Upside:'}</span>
+              <div className="text-sm font-bold text-emerald-400 mt-1">
                 {currentStock.analysts.averagePriceTarget.value} ({currentStock.analysts.impliedAnalystUpside})
               </div>
             </div>
-            <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
-              <span className="text-slate-400">{isHe ? 'עדכוני תחזיות (30D/90D):' : '30D/90D Revisions:'}</span>
-              <div className="text-xs font-bold text-cyan-300 mt-0.5">
+            <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 font-mono">
+              <span className="text-slate-400 block">{isHe ? 'עדכוני תחזיות (30D/90D):' : '30D/90D Revisions:'}</span>
+              <div className="text-sm font-bold text-cyan-300 mt-1">
                 {currentStock.analysts.epsRevisions30D}
               </div>
             </div>
-          </div>
-
-          <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 text-xs">
-            <span className="text-amber-400 font-mono font-semibold">{isHe ? 'פער ציפיות מול קונצנזוס:' : 'Expectations Gap:'}</span>
-            <p className="text-slate-300 mt-1">{currentStock.analysts.expectationsGap.explanation}</p>
+            <div className="p-3 rounded-lg bg-slate-950 border border-slate-800">
+              <span className="text-amber-400 font-semibold block">{isHe ? 'פער ציפיות מול השוק:' : 'Expectations Gap:'}</span>
+              <p className="text-slate-300 mt-1 leading-relaxed">{currentStock.analysts.expectationsGap.explanation}</p>
+            </div>
           </div>
 
           {/* Full Interactive Senior Analyst Rankings & Valuations */}
@@ -691,7 +690,7 @@ export const DeepDiveTop5: React.FC<DeepDiveTop5Props> = ({
         </div>
 
         {/* 8. Red Flags & Value Trap Detector */}
-        <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-5 space-y-3">
+        <div className="lg:col-span-2 bg-slate-900/80 border border-slate-800 rounded-xl p-5 space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2 text-rose-400 font-bold text-sm">
               <AlertTriangle className="w-4 h-4" />
@@ -702,17 +701,17 @@ export const DeepDiveTop5: React.FC<DeepDiveTop5Props> = ({
             </span>
           </div>
 
-          <div className="space-y-2 text-xs">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
             {currentStock.redFlags.map((flag, idx) => (
-              <div key={idx} className="p-2.5 rounded bg-slate-950 border border-slate-800">
-                <div className="flex items-center justify-between">
+              <div key={idx} className="p-3 rounded-lg bg-slate-950 border border-slate-800">
+                <div className="flex items-center justify-between gap-2">
                   <span className="font-bold text-slate-200">{flag.title}</span>
-                  <span className="text-[10px] font-mono px-1.5 py-0.2 rounded bg-slate-800 text-slate-400">
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-400 shrink-0">
                     {flag.category} • {flag.severity}
                   </span>
                 </div>
-                <p className="text-slate-400 text-[11px] mt-1">{flag.description}</p>
-                <div className="text-slate-300 text-[11px] font-mono mt-1">{isHe ? 'השפעה:' : 'Impact:'} {flag.impact}</div>
+                <p className="text-slate-400 text-xs mt-1 leading-relaxed">{flag.description}</p>
+                <div className="text-slate-300 text-[11px] font-mono mt-1.5">{isHe ? 'השפעה:' : 'Impact:'} {flag.impact}</div>
               </div>
             ))}
           </div>
