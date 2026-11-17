@@ -9,6 +9,7 @@ import { getResearchStock } from '../data/researchStockGenerator';
 import { getStockCompetitiveProfile } from '../data/thesisAndCompetitiveData';
 import { SeniorAnalystRankings } from './SeniorAnalystRankings';
 import { ShareStockReportModal } from './ShareStockReportModal';
+import { CompanyProfileSection } from './CompanyProfileSection';
 import {
   openWhatsAppShare,
   openEmailShare,
@@ -398,6 +399,9 @@ export const DeepDiveTop5: React.FC<DeepDiveTop5Props> = ({
           currentLang={currentLang}
         />
       </div>
+
+      {/* 0. Company Profile: What it Does, Segments & Investment Avenues */}
+      <CompanyProfileSection stock={currentStock} currentLang={currentLang} />
 
       {/* Grid of Analytical Sections */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

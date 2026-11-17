@@ -7,6 +7,7 @@ import { getStockCompetitiveProfile } from '../data/thesisAndCompetitiveData';
 import { StockLogoBadge } from './StockLogoBadge';
 import { StockLiveChart } from './StockLiveChart';
 import { ShareStockReportModal } from './ShareStockReportModal';
+import { CompanyProfileSection } from './CompanyProfileSection';
 import {
   openWhatsAppShare,
   openEmailShare,
@@ -323,6 +324,9 @@ export const LiveTickerAnalyzer: React.FC<LiveTickerAnalyzerProps> = ({
               currentLang={currentLang}
             />
           </div>
+
+          {/* Company Business Overview, Segments & Investment Avenues */}
+          <CompanyProfileSection stock={localizedResult} currentLang={currentLang} />
 
           {/* COMPREHENSIVE VALUATION & DECISION BANNER (NEW) */}
           <div className="bg-slate-950 border border-cyan-800/60 rounded-xl p-4 sm:p-5 space-y-4">

@@ -3572,11 +3572,21 @@ Return ONLY a valid JSON object matching this exact TypeScript structure:
   "moatDefenseMechanism": string,
   "fiveYearGrowthDrivers": string[],
   "primaryFailureRisks": string[],
-  "whyInTopUniverse": string
+  "whyInTopUniverse": string,
+  "companyProfile": {
+    "whatItDoesHe": string (2 clear Hebrew sentences explaining plainly what the company is and what it does),
+    "whatItDoesEn": string (2 clear English sentences explaining what the company does),
+    "revenueModelHe": string (1-2 clear Hebrew sentences explaining how the company makes money),
+    "revenueModelEn": string,
+    "businessSegmentsHe": string[] (3-4 concise Hebrew bullet strings listing its main business lines/products),
+    "businessSegmentsEn": string[],
+    "investmentAvenuesHe": string[] (3-4 concise Hebrew bullet strings listing where the company invests its capital: R&D, factories/data centers CapEx, M&A, buybacks/dividends, expansion),
+    "investmentAvenuesEn": string[]
+  }
 }`;
 
-    // Try Gemini with fallback models if capacity allows
-    const candidateModels = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.1-flash-lite'];
+    // Try Gemini 4 Hydrogen first with fallback models if capacity allows
+    const candidateModels = ['gemini-4-hydrogen', 'gemini-flash-latest'];
     let generatedStock: any = null;
 
     if (isGeminiAvailable()) {
@@ -3589,6 +3599,9 @@ Return ONLY a valid JSON object matching this exact TypeScript structure:
               contents: prompt,
               config: {
                 responseMimeType: 'application/json',
+                ...(modelName === 'gemini-4-hydrogen'
+                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                  : {}),
               },
             });
 
@@ -4577,12 +4590,213 @@ Return ONLY valid JSON:
   }
 });
 
+// Live Company Profile, Business Activity & Investment Avenues Endpoint (SEC EDGAR + Gemini)
+const companyProfileCache = new Map<string, { profile: any; expiresAt: number }>();
+
+app.get('/api/company-profile/:ticker', async (req, res) => {
+  try {
+    const raw = String(req.params.ticker || '').toUpperCase().trim();
+    const cleanTicker = SERVER_TICKER_ALIASES[raw] || raw;
+    if (!cleanTicker) {
+      res.status(400).json({ error: 'Ticker is required' });
+      return;
+    }
+
+    const cached = companyProfileCache.get(cleanTicker);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.json({ ticker: cleanTicker, profile: cached.profile, cached: true });
+      return;
+    }
+
+    // Lookup official SEC metadata (legal entity name + SIC industry description)
+    let entityName = cleanTicker;
+    let sicDescription = '';
+    try {
+      const tickerMap = await getSecTickerMap();
+      const matched =
+        tickerMap[cleanTicker] ||
+        tickerMap[cleanTicker.replace(/\./g, '-')] ||
+        tickerMap[cleanTicker.replace(/-/g, '.')];
+      if (matched) {
+        entityName = matched.title || cleanTicker;
+        const subResp = await fetch(`https://data.sec.gov/submissions/CIK${matched.cik}.json`, {
+          headers: { 'User-Agent': SEC_USER_AGENT, Accept: 'application/json' },
+          signal: AbortSignal.timeout(6000),
+        });
+        if (subResp.ok) {
+          const subJson: any = await subResp.json();
+          if (subJson?.name) entityName = subJson.name;
+          if (subJson?.sicDescription) sicDescription = subJson.sicDescription;
+        }
+      }
+    } catch {
+      // continue smoothly with ticker + Gemini
+    }
+
+    // Fetch Hebrew & English Wikipedia summaries in parallel as rich factual grounding
+    let wikiHeExtract = '';
+    let wikiEnExtract = '';
+    try {
+      const searchName = entityName
+        .replace(/\b(INC\.?|CORP\.?|CORPORATION|LTD\.?|PLC|L\.P\.?|CO\.?|HOLDINGS?|GROUP)\b/gi, '')
+        .replace(/[,.\s]+/g, ' ')
+        .trim() || cleanTicker;
+      const [heResp, enResp] = await Promise.all([
+        fetch(`https://he.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(searchName)}&format=json&srlimit=1`, {
+          headers: { 'User-Agent': 'MoatGuardResearch/1.0' },
+          signal: AbortSignal.timeout(4000),
+        }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+        fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(searchName + ' company')}&format=json&srlimit=1`, {
+          headers: { 'User-Agent': 'MoatGuardResearch/1.0' },
+          signal: AbortSignal.timeout(4000),
+        }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      ]);
+
+      const heTitle = heResp?.query?.search?.[0]?.title;
+      const enTitle = enResp?.query?.search?.[0]?.title;
+
+      const [heSum, enSum] = await Promise.all([
+        heTitle
+          ? fetch(`https://he.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(heTitle)}`, {
+              headers: { 'User-Agent': 'MoatGuardResearch/1.0' },
+              signal: AbortSignal.timeout(4000),
+            }).then((r) => (r.ok ? r.json() : null)).catch(() => null)
+          : Promise.resolve(null),
+        enTitle
+          ? fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(enTitle)}`, {
+              headers: { 'User-Agent': 'MoatGuardResearch/1.0' },
+              signal: AbortSignal.timeout(4000),
+            }).then((r) => (r.ok ? r.json() : null)).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+
+      if (heSum?.extract && typeof heSum.extract === 'string') {
+        wikiHeExtract = heSum.extract.split(/(?<=[.!?])\s+/).slice(0, 2).join(' ').trim();
+      }
+      if (enSum?.extract && typeof enSum.extract === 'string') {
+        wikiEnExtract = enSum.extract.split(/(?<=[.!?])\s+/).slice(0, 2).join(' ').trim();
+      }
+    } catch {
+      // ignore wikipedia errors
+    }
+
+    const fallbackProfile = {
+      whatItDoesHe:
+        wikiHeExtract ||
+        (wikiEnExtract
+          ? `${entityName} (${cleanTicker}) — פרופיל פעילות (${sicDescription || 'חברה ציבורית בארה״ב'}): ${wikiEnExtract}`
+          : `${entityName} (${cleanTicker}) היא חברה ציבורית אמריקאית הפועלת בתחום ${sicDescription || 'השירותים והטכנולוגיה המוסדיים'}.`),
+      whatItDoesEn:
+        wikiEnExtract ||
+        `${entityName} (${cleanTicker}) is a US-listed public company operating in ${sicDescription || 'institutional products and services'}.`,
+      revenueModelHe: `מכירת מוצרים ושירותים מובילים ללקוחות בתחום ${sicDescription || 'הליבה העסקית'} תוך מינוף יתרון גודל ושימור לקוחות.`,
+      revenueModelEn: `Delivering core products and recurring services within ${sicDescription || 'its primary market'}.`,
+      businessSegmentsHe: [
+        `תחום עיסוק רשמי (SEC): ${sicDescription || cleanTicker}.`,
+        'אספקת פתרונות, מוצרים או שירותים ללקוחות עסקיים ופרטיים.',
+      ],
+      businessSegmentsEn: [
+        `Official SEC Classification: ${sicDescription || cleanTicker}.`,
+        'Enterprise and consumer solution delivery.',
+      ],
+      investmentAvenuesHe: [
+        'השקעה במו"פ (R&D) ובפיתוח קווי מוצרים חדשים להגדלת נתח השוק.',
+        'השקעות הון בתשתיות תפעול, יעילות והתרחבות מסחרית.',
+        'הקצאת הון בין צמיחה אורגנית, רכישות אסטרטגיות והחזר לבעלי המניות.',
+      ],
+      investmentAvenuesEn: [
+        'R&D investment in product innovation and market-share expansion.',
+        'Operational infrastructure CapEx and commercial scaling.',
+        'Balanced capital allocation across organic growth, M&A, and shareholder returns.',
+      ],
+      secIndustry: sicDescription,
+      entityName,
+      source: wikiHeExtract || wikiEnExtract ? 'sec_wiki_grounded' : 'sec_grounded_fallback',
+    };
+
+    if (isGeminiAvailable()) {
+      const ai = getAI();
+      if (ai) {
+        try {
+          const prompt = `Provide an accurate, practical company overview for stock ticker "${cleanTicker}" (${entityName}${sicDescription ? `, SEC Industry: ${sicDescription}` : ''}).
+${wikiEnExtract ? `Verified Business Summary: ${wikiEnExtract}` : ''}
+Explain clearly in simple, natural Hebrew AND English:
+1. What the company actually is and does (whatItDoesHe / whatItDoesEn)
+2. How it makes money (revenueModelHe / revenueModelEn)
+3. Its 3 main business segments / product lines (businessSegmentsHe / businessSegmentsEn)
+4. Its 3 main investment avenues / capital allocation priorities (investmentAvenuesHe / investmentAvenuesEn — e.g., R&D, CapEx factories/data centers, strategic acquisitions, buybacks/dividends, international expansion).
+
+Return strictly JSON matching:
+{
+  "whatItDoesHe": string,
+  "whatItDoesEn": string,
+  "revenueModelHe": string,
+  "revenueModelEn": string,
+  "businessSegmentsHe": string[],
+  "businessSegmentsEn": string[],
+  "investmentAvenuesHe": string[],
+  "investmentAvenuesEn": string[]
+}`;
+          const response = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: prompt,
+            config: {
+              responseMimeType: 'application/json',
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          });
+          const parsed = safeParseJsonObject(response.text || '');
+          if (parsed && parsed.whatItDoesHe && Array.isArray(parsed.businessSegmentsHe)) {
+            const enriched = {
+              ...parsed,
+              secIndustry: sicDescription,
+              entityName,
+              source: 'sec_gemini_live',
+            };
+            companyProfileCache.set(cleanTicker, {
+              profile: enriched,
+              expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+            });
+            res.json({ ticker: cleanTicker, profile: enriched });
+            return;
+          }
+        } catch (aiErr) {
+          recordGeminiError(aiErr);
+        }
+      }
+    }
+
+    companyProfileCache.set(cleanTicker, {
+      profile: fallbackProfile,
+      expiresAt: Date.now() + 60 * 60 * 1000,
+    });
+    res.json({ ticker: cleanTicker, profile: fallbackProfile });
+  } catch (err: any) {
+    console.error('Company profile error:', err?.message || err);
+    res.status(500).json({ error: 'Failed to retrieve company profile' });
+  }
+});
+
 // Ensure ALL unhandled /api/* requests return JSON and NEVER fall through to Vite SPA HTML
 app.all('/api/*', (req, res) => {
   res.status(404).json({ error: `Not Found: ${req.method} ${req.path}` });
 });
 
 async function startServer() {
+  const publicPath = path.join(process.cwd(), 'public');
+  const faviconIcoPath = path.join(publicPath, 'favicon.ico');
+  app.get('/favicon.ico', (_req, res) => {
+    if (fs.existsSync(faviconIcoPath)) {
+      res.setHeader('Content-Type', 'image/x-icon');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.sendFile(faviconIcoPath);
+      return;
+    }
+    res.status(404).end();
+  });
+  if (fs.existsSync(publicPath)) {
+    app.use(express.static(publicPath, { maxAge: '1h' }));
+  }
   const distPath = path.join(process.cwd(), 'dist');
   const isProduction =
     process.env.NODE_ENV === 'production' ||

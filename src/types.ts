@@ -272,6 +272,20 @@ export interface ResearchStock {
   fiveYearGrowthDrivers: string[];
   primaryFailureRisks: string[];
   whyInTopUniverse: string;
+  companyProfile?: CompanyProfileInfo;
+}
+
+export interface CompanyProfileInfo {
+  whatItDoesHe: string;
+  whatItDoesEn: string;
+  revenueModelHe?: string;
+  revenueModelEn?: string;
+  businessSegmentsHe: string[];
+  businessSegmentsEn: string[];
+  investmentAvenuesHe: string[];
+  investmentAvenuesEn: string[];
+  secIndustry?: string;
+  source?: string;
 }
 
 export interface PortfolioPosition {

@@ -801,6 +801,10 @@ export default function App() {
   };
   const currentPageTitle = pageTitleMap[activeTab]?.[currentLang === 'he' ? 'he' : 'en'] || (currentLang === 'he' ? 'סקירה ראשית' : 'Overview');
 
+  useEffect(() => {
+    document.title = `MoatGuard · ${currentPageTitle}`;
+  }, [currentPageTitle]);
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans selection:bg-cyan-500/30 selection:text-cyan-200">
       {/* Navigation Sidebar (Desktop Fixed + Mobile Drawer) */}

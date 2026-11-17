@@ -8,6 +8,7 @@ import { localizeStock } from '../data/stockLocalization';
 import { getStockCompetitiveProfile } from '../data/thesisAndCompetitiveData';
 import { SeniorAnalystRankings } from './SeniorAnalystRankings';
 import { ShareStockReportModal } from './ShareStockReportModal';
+import { CompanyProfileSection } from './CompanyProfileSection';
 import {
   openWhatsAppShare,
   openEmailShare,
@@ -201,6 +202,9 @@ export const StockDetailModal: React.FC<StockDetailModalProps> = ({
         {/* Tab 1: Overview & Intrinsic DCF */}
         {activeTab === 'overview' && (
           <div className="space-y-5">
+            {/* Company Business Activity, Segments & Investment Avenues */}
+            <CompanyProfileSection stock={stock} currentLang={currentLang} />
+
             {/* Reverse DCF & Expectations Strip */}
             <div className="p-4 rounded-xl bg-slate-950 border border-cyan-800/70 space-y-3 font-mono">
               <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 pb-2.5 border-b border-slate-800">
