@@ -967,6 +967,38 @@ export const CURATED_COMPANY_PROFILES: Record<string, CompanyProfileInfo> = {
       'Scaling Aladdin technology and digital asset ETFs.',
     ],
   },
+  CHKP: {
+    whatItDoesHe:
+      'צ׳ק פוינט (Check Point) היא מחלוצות הסייבר העולמיות (הוקמה בישראל ב-1993), המספקת פלטפורמות הגנה מפני מתקפות סייבר עבור רשתות ארגוניות, ענן, עמדות קצה ומכשירים ניידים ליותר מ-100,000 ארגונים ברחבי העולם.',
+    whatItDoesEn:
+      'Check Point Software Technologies is a global cybersecurity pioneer providing AI-powered threat-prevention platforms across enterprise networks, cloud environments, endpoints, and workspaces to over 100,000 organizations.',
+    revenueModelHe:
+      'מנויי אבטחה שנתיים וחוזריים (Subscriptions), שירותי תמיכה ועדכוני תוכנה, וכן מכירת חומרת חומות אש (Quantum Appliances) עם שיעורי חידוש גבוהים ותזרים מזומנים יציב.',
+    revenueModelEn:
+      'Recurring annual security subscriptions, software support & maintenance contracts, alongside Quantum firewall security gateway appliances.',
+    businessSegmentsHe: [
+      'Check Point Quantum (אבטחת רשת וארגון): חומות אש ארגוניות מתקדמות ומניעת מתקפות Zero-Day.',
+      'Check Point CloudGuard (אבטחת ענן): הגנה על תשתיות AWS/Azure/GCP, קונטיינרים ויישומי ענן.',
+      'Check Point Harmony (גישה מאובטחת ועובדים): אבטחת אימייל, דפדפנים, מחשבים, מובייל ופתרונות SASE.',
+      'Infinity Platform & AI Security: פלטפורמת ניהול מאוחדת המשלבת מודלי AI ואבטחת יישומי בינה מלאכותית (Lakera / External Risk Management).',
+    ],
+    businessSegmentsEn: [
+      'Quantum Network Security: High-throughput enterprise firewalls and Zero-Day prevention.',
+      'CloudGuard: Unified cloud posture management and workload security.',
+      'Harmony & SASE: Unified workspace, email, browser, and endpoint security.',
+      'Infinity Platform & AI Security: Consolidated management and generative AI application security.',
+    ],
+    investmentAvenuesHe: [
+      'רכישות אסטרטגיות משלימות בעולמות ה-SASE, אבטחת הענן והגנת ה-AI (כגון Perimeter 81, Cyberint, Lakera).',
+      'השקעה מתמשכת במחקר ופיתוח של פלטפורמת Infinity ומנועי AI ThreatCloud.',
+      'תוכנית רכישה עצמית עקבית של מניות (Buybacks) המצמצמת את כמות המניות בכ-3%–4% בשנה ומגדילה את הרווח למניה.',
+    ],
+    investmentAvenuesEn: [
+      'Targeted bolt-on acquisitions across SASE, cloud/external risk management, and AI security (Perimeter 81, Cyberint, Lakera).',
+      'Continuous R&D investments into the Infinity Platform and ThreatCloud AI.',
+      'Consistent free-cash-flow share repurchase program shrinking share count ~3–4% annually.',
+    ],
+  },
 };
 
 export function getInstantCompanyProfile(stock: ResearchStock): CompanyProfileInfo {

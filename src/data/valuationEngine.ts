@@ -97,41 +97,47 @@ export function extractFinancialInputs(stock: ResearchStock, livePrice?: number,
     ? livePrice 
     : (!isNaN(parsedPrice) && parsedPrice > 0 ? parsedPrice : 100);
 
+  const parseToBillions = (raw: string, fallback: number): number => {
+    const m = (raw || '').match(/([0-9]+(?:\.[0-9]+)?)\s*([TBMK])?/i);
+    if (!m) return fallback;
+    const val = parseFloat(m[1]);
+    if (isNaN(val)) return fallback;
+    const unit = (m[2] || 'B').toUpperCase();
+    if (unit === 'T') return val * 1000;
+    if (unit === 'M') return val / 1000;
+    if (unit === 'K') return val / 1_000_000;
+    return val;
+  };
+
   // 2. Shares Outstanding (Billions)
-  const rawCapStr = (stock.marketCap || '').replace(/[^0-9.]/g, '');
-  const parsedCap = parseFloat(rawCapStr) || 250;
-  const autoShares = Math.max(0.05, parsedCap / currentPrice);
+  const parsedCap = parseToBillions(stock.marketCap || '', 250);
+  const autoShares = Math.max(0.01, parsedCap / currentPrice);
   const sharesBillion = overrides?.sharesBillion !== undefined && overrides.sharesBillion > 0 
     ? overrides.sharesBillion 
     : autoShares;
 
   // 3. FCF TTM (Billions)
   const fcfStr = stock.financialQuality?.fcfTTM?.value || '';
-  const fcfMatch = fcfStr.match(/([0-9.]+)/);
-  const parsedFcf = fcfMatch ? parseFloat(fcfMatch[1]) : (sharesBillion * currentPrice * 0.042);
+  const parsedFcf = parseToBillions(fcfStr, sharesBillion * currentPrice * 0.042);
   const baseFcfBillion = overrides?.customBaseFcfBillion !== undefined && overrides.customBaseFcfBillion > 0
     ? overrides.customBaseFcfBillion
-    : Math.max(0.1, parsedFcf);
+    : Math.max(0.05, parsedFcf);
 
   // 4. Cash and Equivalents (Billions)
-  let autoCash = sharesBillion * currentPrice * 0.06; // default ~6% of market cap
   const cashStr = stock.financialQuality?.cashAndEquivalents?.value || '';
-  const cashMatch = cashStr.match(/\$?([0-9.]+)B/);
-  if (cashMatch) {
-    autoCash = parseFloat(cashMatch[1]);
-  }
+  const autoCash = parseToBillions(cashStr, sharesBillion * currentPrice * 0.06);
   const cashBillion = overrides?.cashBillion !== undefined ? overrides.cashBillion : autoCash;
 
   // 5. Total Debt (Billions)
   let autoDebt = sharesBillion * currentPrice * 0.08;
   const debtStr = stock.financialQuality?.netDebt?.value || '';
-  const debtMatch = debtStr.match(/\$?([0-9.]+)B/);
+  const hasExplicitDebtNum = /([0-9]+(?:\.[0-9]+)?)\s*([TBMK])?/i.test(debtStr);
   if (debtStr.includes('Net Cash') || debtStr.startsWith('-$')) {
     // Net cash company: debt is lower than cash
-    const netCashAmount = debtMatch ? parseFloat(debtMatch[1]) : autoCash * 0.5;
+    const netCashAmount = hasExplicitDebtNum ? parseToBillions(debtStr, autoCash * 0.5) : autoCash * 0.5;
     autoDebt = Math.max(0, autoCash - netCashAmount);
-  } else if (debtMatch) {
-    autoDebt = parseFloat(debtMatch[1]) + autoCash; // Net Debt + Cash = Total Debt
+  } else if (hasExplicitDebtNum) {
+    autoDebt = parseToBillions(debtStr, 0) + autoCash; // Net Debt + Cash = Total Debt
   }
   const debtBillion = overrides?.debtBillion !== undefined ? overrides.debtBillion : autoDebt;
 

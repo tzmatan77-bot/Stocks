@@ -46,6 +46,7 @@ export const KNOWN_CATALOG_PRICES: Record<string, number> = {
   KLAC: 138.49,
   ARM: 174.62,
   ANET: 170.80,
+  CHKP: 153.54,
   
   // Healthcare, Pharmaceuticals & Medical Devices
   NVO: 40.31,
@@ -192,6 +193,7 @@ export const EXTRA_POPULAR_STOCKS_METADATA: Record<string, Partial<MarketScreene
   WFC: { name: 'Wells Fargo & Company', nameHe: 'וולס פארגו', sector: 'Financials', sectorHe: 'בנקאות מסחרית ומשכנתאות', marketCap: '$230B', pe: 12.0, roic: 12.5, moat: 'Core US retail branch presence and commercial lending franchise', moatHe: 'סניפים קמעונאיים מובילים בארה\"ב והלוואות מסחריות' },
   SCHW: { name: 'The Charles Schwab Corporation', nameHe: 'צ\'ארלס שוואב', sector: 'Financials', sectorHe: 'ניהול עושר וברוקראז\'', marketCap: '$150B', pe: 24.0, roic: 16.0, moat: 'Multi-trillion dollar custodial client assets and low unit operating costs', moatHe: 'נכסי לקוחות של מעל 9 טריליון דולר ויתרון לגודל' },
   AXP: { name: 'American Express Company', nameHe: 'אמריקן אקספרס', sector: 'Financials', sectorHe: 'כרטיסי אשראי פרימיום', marketCap: '$225B', pe: 19.5, roic: 32.0, moat: 'Closed-loop spend-centric card network and premium affluent cardholder base', moatHe: 'רשת תשלומים סגורה ומחזיקי כרטיסי יוקרה בעלי הוצאה גבוהה' },
+  CHKP: { name: 'Check Point Software Technologies Ltd.', nameHe: "צ'ק פוינט", sector: 'Technology', sectorHe: 'אבטחת סייבר ותוכנה', marketCap: '$16.2B', pe: 15.3, roic: 20.4, fcfYield: 7.2, divYield: 0.0, cagr5y: '8.5%', score: 83, moat: 'Quantum/Harmony/CloudGuard enterprise firewall & Infinity platform switching costs', moatHe: 'פלטפורמת Infinity ומערכות Quantum/CloudGuard עם עלויות מעבר גבוהות ושימור לקוחות ארגוניים', descriptionHe: "מובילה גלובלית באבטחת סייבר עם תזרים מזומנים חופשי חזק במיוחד (43% מהמכירות), מאזן נטו מזומן והתמחור נוח, מול צמיחת הכנסות חד-ספרתית מתונה (+6.2%)." },
 };
 
 // Real-time live prices registry updated directly from /api/quotes
@@ -718,6 +720,10 @@ export const TICKER_ALIASES: Record<string, string> = {
   'נייקי': 'NKE',
   'TJX': 'TJX',
   'טי ג\'יי אקס': 'TJX',
+  'CHECK POINT': 'CHKP',
+  'CHECKPOINT': 'CHKP',
+  "צ'ק פוינט": 'CHKP',
+  'צק פוינט': 'CHKP',
 };
 
 /**
@@ -813,19 +819,19 @@ export function getResearchStock(ticker: string, livePriceOverride?: number): Re
     exchange: 'NASDAQ',
     sector: extraMeta?.sector || 'Technology',
     sectorHe: extraMeta?.sectorHe || 'טכנולוגיה ומסחר',
-    marketCap: extraMeta?.marketCap || (knownPrice ? `$${Math.round(knownPrice * 0.45)}B` : '$50.0B'),
-    pe: extraMeta?.pe || 24.0,
-    roic: extraMeta?.roic || 20.0,
-    fcfYield: 3.8,
-    divYield: 0.5,
-    cagr5y: '14.0%',
-    score: 86,
+    marketCap: extraMeta?.marketCap || (knownPrice ? `$${Math.max(1, Math.round(knownPrice * 0.25))}B` : '$20.0B'),
+    pe: extraMeta?.pe ?? 22.0,
+    roic: extraMeta?.roic ?? 18.0,
+    fcfYield: extraMeta?.fcfYield ?? 3.8,
+    divYield: extraMeta?.divYield ?? 0.0,
+    cagr5y: extraMeta?.cagr5y || '10.0%',
+    score: extraMeta?.score ?? 80,
     moat: extraMeta?.moat || 'Proprietary Technology & Established Market Scale',
     moatHe: extraMeta?.moatHe || 'טכנולוגיה קניינית ויתרון גודל בשוק',
-    descriptionHe: `חברה מובילה בתחומה עם מאזן איתן ותשואה גבוהה על ההון המושקע.`
+    descriptionHe: extraMeta?.descriptionHe || `חברה מובילה בתחומה עם מאזן איתן ותשואה גבוהה על ההון המושקע.`
   };
 
-  return buildResearchStockFromCatalog(fallbackItem);
+  return buildResearchStockFromCatalog(fallbackItem, effectivePrice);
 }
 
 /**
