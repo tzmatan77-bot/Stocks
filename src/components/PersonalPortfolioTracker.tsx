@@ -6,7 +6,6 @@ import { SupportedLanguage } from '../i18n';
 import { localizeStock } from '../data/stockLocalization';
 import { MARKET_UNIVERSE_CATALOG, MarketScreenerStock } from '../data/marketUniverseData';
 import { getResearchStock } from '../data/researchStockGenerator';
-import { INITIAL_PREMARKET_NEWS_FEED } from '../data/premarketNewsData';
 import {
   Briefcase,
   Plus,
@@ -973,9 +972,18 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
     const ticker = pos.ticker.toUpperCase().trim();
     const company = pos.companyName || pos.matchedStock?.companyName || `${ticker} Corp`;
 
-    // 1. Check API scanned alert
+    // 1. Check live API scanned alert — ONLY surface material/fresh breaking catalysts (ignore quiet-period or routine neutral items)
     const apiAlert = portfolioNewsAlerts[ticker];
-    if (apiAlert) {
+    const hasSignificantLiveMove = pos.dailyChangePct <= -2.0 || pos.dailyChangePct >= 3.0;
+    const isMaterialApiCatalyst =
+      apiAlert &&
+      apiAlert.hasFreshNews !== false &&
+      (apiAlert.catalystSeverity === 'CRITICAL' ||
+        apiAlert.catalystSeverity === 'HIGH' ||
+        apiAlert.sentiment === 'BEARISH' ||
+        apiAlert.sentiment === 'BULLISH');
+
+    if (apiAlert && (isMaterialApiCatalyst || hasSignificantLiveMove)) {
       const isBull = apiAlert.sentiment === 'BULLISH' || apiAlert.movementType === 'IMPENDING_JUMP';
       const isBear = apiAlert.sentiment === 'BEARISH' || apiAlert.movementType === 'SHARP_DROP_WARNING';
       const isCritical = isBear && (apiAlert.catalystSeverity === 'CRITICAL' || pos.dailyChangePct <= -3.0);
@@ -1004,127 +1012,14 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
         summary: apiAlert.summary,
         badgeLabel,
         actionLabel: apiAlert.recommendation?.actionLabelHe || (isHe ? 'מעקב וניהול פוזיציה' : 'Position Monitoring'),
-        openingBellPlan: apiAlert.recommendation?.openingBellGamePlanHe || (isHe ? 'המתנה לפתיחה מסודרת ללא פעולות חפוזות.' : 'Wait for order balance.'),
+        openingBellPlan: apiAlert.recommendation?.openingBellGamePlanHe || (isHe ? 'המתנה להתייצבות ללא פעולה חפוזה.' : 'Wait for price stabilization.'),
         impactOnMoat: apiAlert.recommendation?.impactAnalysisHe || (isHe ? 'מעקב מוסדי אחר תוצאות הפעילות.' : 'Institutional thesis tracking.'),
         source: apiAlert.source,
         publishedTime: apiAlert.publishedTime,
       };
     }
 
-    // 2. Pre-market curated news feed
-    const pmMatch = INITIAL_PREMARKET_NEWS_FEED.find((n) => n.ticker.toUpperCase() === ticker);
-    if (pmMatch) {
-      const isBull = pmMatch.sentiment === 'BULLISH' || pmMatch.movementType === 'IMPENDING_JUMP';
-      const isBear = pmMatch.sentiment === 'BEARISH' || pmMatch.movementType === 'SHARP_DROP_WARNING';
-      const isCritical = isBear && (pmMatch.catalystSeverity === 'CRITICAL' || pos.dailyChangePct <= -3.0);
-
-      const severity: 'CRITICAL' | 'WARNING' | 'OPPORTUNITY' | 'FORECAST' = isCritical
-        ? 'CRITICAL'
-        : isBear
-        ? 'WARNING'
-        : isBull
-        ? 'OPPORTUNITY'
-        : 'FORECAST';
-
-      const badgeLabel = isCritical
-        ? (isHe ? '⚠️ אזהרת ירידה חדה' : '⚠️ Downside Warning')
-        : isBear
-        ? (isHe ? '⚠️ זהירות ותנודתיות' : '⚠️ Volatility Caution')
-        : isBull
-        ? (isHe ? '🚀 זרז חיובי לפריצה' : '🚀 Bullish Catalyst')
-        : (isHe ? '🔵 שינוי תחזיות ומעקב' : '🔵 Forecast Revision');
-
-      return {
-        ticker,
-        companyName: company,
-        severity,
-        title: pmMatch.headline,
-        summary: pmMatch.summary,
-        badgeLabel,
-        actionLabel: isHe ? pmMatch.recommendation.actionLabelHe : pmMatch.recommendation.actionLabelEn,
-        openingBellPlan: isHe ? pmMatch.recommendation.openingBellGamePlanHe : pmMatch.recommendation.openingBellGamePlanEn,
-        impactOnMoat: isHe ? pmMatch.recommendation.impactAnalysisHe : pmMatch.recommendation.impactAnalysisEn,
-        source: pmMatch.source,
-        publishedTime: pmMatch.publishedTime,
-      };
-    }
-
-    // 3. Special Case: Boston Scientific (BSX)
-    if (ticker === 'BSX') {
-      return {
-        ticker: 'BSX',
-        companyName: company,
-        severity: 'CRITICAL' as const,
-        title: isHe
-          ? '⚠️ אזהרת רווח ושיבוש תפעולי: מתקפת סייבר גלובלית משביתה קווי ייצור ומשלוחי הזמנות של בוסטון סיינטיפיק'
-          : '⚠️ Profit & Operations Warning: Global Cyberattack Disrupts Manufacturing & Shipments',
-        summary: isHe
-          ? 'בוסטון סיינטיפיק דיווחה על פגיעת סייבר חמורה במערכות ה-IT הגלובליות. החברה הודיעה כי סביר להניח שלא תעמוד בתחזיות המכירות והרווח למניה (EPS) לרבעון 3 ולשנת 2026, לצד ריקולים למוליכי צנתור Infinion CX.'
-          : 'Boston Scientific reports severe cyber disruption affecting medical device production with expected EPS guidance cut.',
-        badgeLabel: isHe ? '⚠️ סייבר ושיבוש תפעולי' : '⚠️ Cyber Disruption',
-        actionLabel: isHe ? '⚠️ זהירות - שקול מימוש חלקי להגנה' : 'Caution - Consider Trimming',
-        openingBellPlan: isHe
-          ? 'להמתין מחוץ למניה או לממש חלק מהפוזיציה כדי להגן על התיק עד לכימות מלא של הפגיעה הכספית והתייצבות המסחר.'
-          : 'Avoid adding new risk; trim partial shares to hedge against guidance downgrade.',
-        impactOnMoat: isHe
-          ? 'פגיעה תפעולית קצרת טווח עם סיכון לאובדן נתח שוק מול Medtronic ו-Abbott בתחום האלקטרופיזיולוגיה (PFA).'
-          : 'Near-term disruption risking share loss to competitors in electrophysiology catheters.',
-        source: 'Bloomberg / SEC 8-K',
-        publishedTime: '08:15 AM EST',
-      };
-    }
-
-    // 4. Special Case: UnitedHealth Group (UNH)
-    if (ticker === 'UNH') {
-      return {
-        ticker: 'UNH',
-        companyName: company,
-        severity: 'WARNING' as const,
-        title: isHe
-          ? '📊 עדכון שיעור תביעות רפואיות (MLR) והעלאת פרמיות מסחריות ב-6-8%'
-          : '📊 Medical Loss Ratio (MLR) Surge & Commercial Premium Price Adjustments',
-        summary: isHe
-          ? 'יונייטד-הלת מתמודדת עם עליית שיעור התביעות הרפואיות (MLR ל-85.4%). החברה מעלה פרמיות בביטוחים מסחריים כדי להגן על שולי הרווח. החפיר של Optum איתן.'
-          : 'UnitedHealth raises commercial premiums 6-8% to offset higher elective surgical care claims.',
-        badgeLabel: isHe ? '⚠️ בדיקת תמחור ו-MLR' : '⚠️ MLR & Pricing Check',
-        actionLabel: isHe ? 'צבירה מבוקרת בירידות (DCA)' : 'Accumulate on Dips (DCA)',
-        openingBellPlan: isHe
-          ? 'איסוף מנות הדרגתי סביב רמות תמיכה. החברה בעלת כוח תמחור יוצא דופן המאפשר גלגול עלויות.'
-          : 'Stage buying orders near support; strong moat allows passing higher medical costs.',
-        impactOnMoat: isHe
-          ? 'שילוב Optum וביטוח מעניק חפיר עמוק, אך שנת בחירות עשויה להגביר לחץ פוליטי על תמחור שירותי בריאות.'
-          : 'Optum integration provides durable moat, though healthcare reform debates create headline volatility.',
-        source: 'Healthcare Intelligence Digest',
-        publishedTime: '07:45 AM EST',
-      };
-    }
-
-    // 5. Special Case: CVS Health (CVS) - WSJ 2027 Early Warning
-    if (ticker === 'CVS') {
-      return {
-        ticker: 'CVS',
-        companyName: company,
-        severity: 'CRITICAL' as const,
-        title: isHe
-          ? '⚠️ וול סטריט ג\'ורנל (WSJ): אזהרות הנהלה מוקדמות ל-2027 ושחיקת מרווחי Caremark ו-340B'
-          : '⚠️ Wall Street Journal (WSJ): Early 2027 Headwinds & Caremark/340B Margin Erosion',
-        summary: isHe
-          ? 'דיווח ב-WSJ חשף כי מניית CVS צונחת בעקבות אזהרות הנהלה מוקדמות ל-2027: חטיבת Caremark צפויה לחוות ירידה במבוטחים עקב תמחור חוזים ונשירת לקוחות, לצד לחצי רווחיות מתוכנית 340B. תחזית רווח מוקדמת של "לפחות $8.44" נתפסה בוול סטריט כתקרה שמרנית.'
-          : 'WSJ reports CVS shares under severe selling pressure following early 2027 headwinds in Caremark PBM client renewals and 340B drug margin pressures.',
-        badgeLabel: isHe ? '⚠️ אזהרת WSJ 2027' : '⚠️ WSJ 2027 Warning',
-        actionLabel: isHe ? '⚠️ זהירות - שקול מימוש/המתנה להגנה' : 'Caution - Wait or Trim to Protect Capital',
-        openingBellPlan: isHe
-          ? 'להמתין מחוץ למניה או לממש חלק מהפוזיציה להגנה על ההון; אין למהר לקנות עד לספיגת עדכוני התחזיות השליליים של האנליסטים בוול סטריט.'
-          : 'Avoid aggressive dip-buying at open; wait for analyst consensus EPS revisions to settle.',
-        impactOnMoat: isHe
-          ? 'שחיקת מרווחי Caremark והידוק רגולטורי על PBMs בוחנים את עוצמת החפיר, אף שתשואת הדיבידנד כ-4.5% ומכפיל הרווח ההיסטורי נמוך (8.8x).'
-          : 'Caremark margin headwinds and regulatory scrutiny test moat resilience despite ~4.5% dividend yield.',
-        source: 'The Wall Street Journal (WSJ)',
-        publishedTime: '08:10 AM EST',
-      };
-    }
-
-    // 6. Live sharp drop alert (<= -1.8%)
+    // 2. Live sharp drop alert (<= -1.8%)
     if (pos.dailyChangePct <= -1.8) {
       return {
         ticker,
@@ -1595,8 +1490,8 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
                       </div>
                       <p className="text-xs text-rose-300/90 mt-0.5">
                         {isHe
-                          ? 'זוהו קטליזטורים, מתקפת סייבר בבוסטון סיינטיפיק (BSX), לחצי MLR או תנודות חריגות. באפשרותך לממש (למכור) מניות להגנה או לקנות שוב במחיר שונה ולשקלל מחיר ממוצע.'
-                          : 'Critical events, cyberattack alerts (BSX), or sharp moves detected. You can realize/sell shares to protect capital or Buy More at a different price.'}
+                          ? 'זוהו חדשות חיות רלוונטיות או תנודות מחיר מהותיות במניות התיק שלך. באפשרותך לממש (למכור) מניות להגנה או לקנות שוב במחיר שונה ולשקלל מחיר ממוצע.'
+                          : 'Material live news catalysts or sharp intraday moves detected in your holdings. You can realize/sell shares to protect capital or add at a new entry price.'}
                       </p>
                     </div>
                   </div>

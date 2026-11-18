@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 import { safeParseJsonArray, safeParseJsonObject } from './src/utils/geminiJsonUtils.ts';
 import { FULL_UNIVERSE_RESULT, TOP_20_SUMMARY_LIST } from './src/data/universeData.ts';
 import { localizeStock } from './src/data/stockLocalization.ts';
-import { INITIAL_PREMARKET_NEWS_FEED, getCalculatedMarketPulse } from './src/data/premarketNewsData.ts';
+import { getCalculatedMarketPulse } from './src/data/premarketNewsData.ts';
 import { getDailyEarningsData, EarningsReportEvent } from './src/data/dailyEarningsData.ts';
 import { KNOWN_CATALOG_PRICES } from './src/data/researchStockGenerator.ts';
 
@@ -362,7 +362,7 @@ async function fetchBatchQuotesInChunks(tickersList: string[]): Promise<Record<s
 
 // Background Auto-Update Worker: continuously warms cache, ingests live RSS breaking news, and syncs quotes every 30s
 const CORE_BACKGROUND_TICKERS = [
-  'SPY', 'QQQ', 'NVDA', 'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'VLO', 'BE', 'NVMI',
+  'SPY', 'QQQ', '^TNX', '^VIX', 'NVDA', 'AAPL', 'MSFT', 'GOOGL', 'TSLA', 'VLO', 'BE', 'NVMI',
   'BKNG', 'NOW', 'AMZN', 'META', 'AMD', 'LLY', 'COST', 'INTC',
   'BSX', 'CVS', 'KO', 'LRCX', 'UNH', 'JPM', 'NEE', 'SOFI',
   'PLTR', 'ARM', 'ANET', 'CRWD', 'PYPL', 'AVGO'
@@ -375,12 +375,24 @@ function getLiveDynamicPulse() {
   const spyQ = liveQuotesCache.get('SPY')?.quote;
   const qqqQ = liveQuotesCache.get('QQQ')?.quote;
   const nvdaQ = liveQuotesCache.get('NVDA')?.quote;
+  const tnxQ = liveQuotesCache.get('^TNX')?.quote;
+  const vixQ = liveQuotesCache.get('^VIX')?.quote;
 
   const formatDelta = (q?: LiveMarketQuote, fallback: string = basePulse.sp500FuturesChange) => {
     if (!q || q.source !== 'yahoo_finance_live' || typeof q.changePercent !== 'number') return fallback;
     const sign = q.changePercent >= 0 ? '+' : '';
     return `${sign}${q.changePercent.toFixed(2)}%`;
   };
+
+  const liveTnxStr =
+    tnxQ && tnxQ.source === 'yahoo_finance_live' && typeof tnxQ.price === 'number'
+      ? `${tnxQ.price.toFixed(2)}% (${tnxQ.changePercent >= 0 ? '+' : ''}${tnxQ.changePercent.toFixed(2)}%)`
+      : basePulse.tenYearTreasuryYield;
+
+  const liveVixStr =
+    vixQ && vixQ.source === 'yahoo_finance_live' && typeof vixQ.price === 'number'
+      ? `${vixQ.price.toFixed(2)} (${vixQ.changeAmount >= 0 ? '+' : ''}${vixQ.changeAmount.toFixed(2)})`
+      : basePulse.vixLevel;
 
   const spyChg = spyQ?.source === 'yahoo_finance_live' ? spyQ.changePercent : null;
   const qqqChg = qqqQ?.source === 'yahoo_finance_live' ? qqqQ.changePercent : null;
@@ -400,7 +412,7 @@ function getLiveDynamicPulse() {
     const nvdaTxt = nvdaQ?.source === 'yahoo_finance_live'
       ? ` (NVDA ${nvdaQ.changePercent >= 0 ? '+' : ''}${nvdaQ.changePercent.toFixed(2)}%)`
       : '';
-    const leadNoteHe = topBreaking ? ` כותרת מרכזית כעת: ${topBreaking.headline.replace(/^🔴[^:]*:\s*/, '')}` : '';
+    const leadNoteHe = topBreaking ? ` כותרת מרכזית כעת: ${topBreaking.headline.replace(/^[🔴🟢🔵⚡⚠️🚨📊⭐🏛️💻]+\s*/, '')}` : '';
 
     dynamicBriefHe = isRed
       ? `ירידות ותנודתיות בשוק האמריקאי: S&P 500 (SPY) ${spyTxt} והנאסד"ק (QQQ) ${qqqTxt}${nvdaTxt}.${leadNoteHe}`
@@ -413,6 +425,8 @@ function getLiveDynamicPulse() {
     marketSentiment,
     sp500FuturesChange: formatDelta(spyQ, basePulse.sp500FuturesChange),
     nasdaqFuturesChange: formatDelta(qqqQ, basePulse.nasdaqFuturesChange),
+    tenYearTreasuryYield: liveTnxStr,
+    vixLevel: liveVixStr,
     dailyMacroBriefHe: dynamicBriefHe,
     dailyMacroBriefEn: dynamicBriefEn,
   };
@@ -930,9 +944,9 @@ app.get('/api/extended-hours/movers', async (req, res) => {
   }
 });
 
-// Cache for live daily news feed & reaction analysis
-let cachedPremarketNews: any[] = [...INITIAL_PREMARKET_NEWS_FEED];
-let lastPremarketNewsGenerated = Date.now();
+// Cache for live daily news feed & reaction analysis (starts empty so boot/first request populates strictly live news)
+let cachedPremarketNews: any[] = [];
+let lastPremarketNewsGenerated = 0;
 let lastQuotesEnrichedTime = 0;
 let lastRssSyncDateKey = '';
 const dailyAiNewsCache = new Map<string, {
@@ -952,6 +966,15 @@ function getTodayDateKey(): string {
     month: '2-digit',
     day: '2-digit',
   }).format(new Date());
+}
+
+function getDateKeyForMs(ms: number): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Jerusalem',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date(ms));
 }
 
 function buildContextualReactionAnalysis(params: {
@@ -1009,32 +1032,32 @@ function buildContextualReactionAnalysis(params: {
   let defaultOverreactionHe = '';
   let defaultRespondHe = '';
 
-  if (/resign|step.*down|depart|ouster|ceo/.test(lower)) {
-    defaultWhyHe = `שינוי בהנהלה הבכירה של ${ticker} יוצר אי-ודאות מיידית בקרב משקיעים מוסדיים, שעוצרים לבחון האם האסטרטגיה תימשך באותו קצב.`;
-    defaultOverreactionHe = 'בטווח של ימים ראשונים השוק נוטה להגיב בחריפות-יתר לפני מינוי מחליף; המבחן האמיתי הוא המשכיות הצמיחה ברבעון הבא.';
-    defaultRespondHe = 'לא למהר לקנות או למכור בבהלה — להמתין יומיים-שלושה להתייצבות המחיר ולדיווח רשמי מהדירקטוריון.';
-  } else if (catalystType === 'EARNINGS_BEAT' || /beat|surge|soar|record|strong revenue|raises? guidance/.test(lower)) {
-    defaultWhyHe = `הדיווח מצביע על ביקוש חזק מהצפוי או שיפור בתחזית ההכנסות של ${ticker}, מה שדוחף משקיעים לתמחר צמיחה גבוהה יותר ברווחים.`;
-    defaultOverreactionHe = 'כאשר העלייה מגובה בתוצאות כספיות או העלאת תחזית (Guidance), לרוב מדובר במומנטום מבוסס ולא ברעש חולף.';
-    defaultRespondHe = 'למשקיעים קיימים: להמשיך להחזיק. למצטרפים חדשים: להימנע ממרדף אחרי פתיחה חדה ולחכות לנסיגה קלה לטווח כניסה נוח.';
-  } else if (catalystType === 'GUIDANCE_CUT' || /miss|cut|slash|warn|probe|lawsuit|downgrade|tariff|recall/.test(lower)) {
-    defaultWhyHe = `המשקיעים מתמחרים סיכון לפגיעה בקצב הצמיחה או ברווחיות של ${ticker} בעקבות אזהרה, הורדת תחזית או לחץ חיצוני (${source}).`;
+  if (/fed|rate hike|interest rate|inflation|cpi|pce|waller|powell|fomc|treasury/.test(lower)) {
+    defaultWhyHe = `איתותי הריבית והמאקרו של הפדרל ריזרב (${source}) משפיעים ישירות על עלויות המימון ומכפילי התמחור של מניות הצמיחה והשוק כולו.`;
+    defaultOverreactionHe = 'תנודות ראשוניות סביב הצהרות בכירי הפד נוטות להירגע תוך 24-48 שעות כשהשוק בוחן את הנתונים הכלכליים בפועל.';
+    defaultRespondHe = 'לשמור על משמעת תיק, להימנע ממכירות בהלה ולהתמקד בחברות בעלות מאזן חזק וחוב נמוך.';
+  } else if (/resign|step.*down|depart|ouster|scandal|uncertainty|without jensen/.test(lower)) {
+    defaultWhyHe = `שינוי בהנהלה או אי-ודאות ניהולית סביב ${ticker} מעוררים זהירות בקרב משקיעים מוסדיים, הבוחנים את המשכיות האסטרטגיה והביצוע.`;
+    defaultOverreactionHe = 'בטווח של ימים ראשונים השוק נוטה להגיב בתנודתיות יתר לכותרות אישיות; המבחן האמיתי הוא המשך הצמיחה בהזמנות וברווחים.';
+    defaultRespondHe = 'לא למהר לקנות או למכור בבהלה — להמתין להתייצבות המחיר ולעקוב אחר הודעות רשמיות מההנהלה.';
+  } else if (catalystType === 'EARNINGS_BEAT' || /beat|surge|soar|record|strong.*sales|raises? guidance|raises? outlook|hikes guidance/.test(lower)) {
+    defaultWhyHe = `הדיווח מצביע על תוצאות חזקות מהצפוי או העלאת תחזית (Guidance) ב-${ticker}, מה שדוחף משקיעים לתמחר צמיחה גבוהה יותר ברווחים.`;
+    defaultOverreactionHe = 'כאשר העלייה מגובה בדוחות כספיים או בהעלאת תחזית הנהלה, לרוב מדובר במומנטום עסקי מבוסס ולא ברעש חולף.';
+    defaultRespondHe = 'למשקיעים קיימים: להמשיך להחזיק. למצטרפים חדשים: להימנע ממרדף אחרי קפיצה חדה ולחכות לנסיגה קלה לטווח כניסה נוח.';
+  } else if (catalystType === 'GUIDANCE_CUT' || /miss|cut|slash|warn|probe|lawsuit|downgrade|tariff|recall|cyber|risk|urges caution/.test(lower)) {
+    defaultWhyHe = `המשקיעים מתמחרים סיכון לפגיעה בקצב הצמיחה, בביקושים או ברווחיות של ${ticker} בעקבות אזהרה, סיכון רגולטורי או זהירות אנליסטים (${source}).`;
     defaultOverreactionHe = knownMoatHe
-      ? `צריך לבדוק אם מדובר בבעיה נקודתית או בפגיעה ביתרון המרכזי של החברה: ${knownMoatHe}`
-      : 'אם התחזית לשנה הקרובה ירדה ממשית — הלחץ עלול להימשך מספר ימים; אם זו כותרת חולפת, ייתכן שמדובר בהגזמה.';
-    defaultRespondHe = 'מומלץ להמתין להתייצבות מחזורי המסחר ולא לקנות "סכין נופלת" ביום ההודעה הראשון.';
-  } else if (/upgrade|overweight|buy rating|top pick|price target raised/.test(lower)) {
-    defaultWhyHe = `בתי השקעות ואנליסטים (${source}) העלו דירוג או מחיר יעד עבור ${ticker}, מה שמושך קניות של קרנות ומשקיעים עוקבים.`;
-    defaultOverreactionHe = 'שדרוג המלצה מוסדי מחזק את הסנטימנט הקצר, אך חשוב לוודא שהשווי הנוכחי עדיין סביר ביחס לרווח.';
-    defaultRespondHe = 'הזדמנות לבחון איסוף הדרגתי בתיק או במעקב, תוך בדיקת תוצאות הרבעון האחרון.';
-  } else if (/ai|chip|blackwell|cloud|data center|contract|deal|partnership/.test(lower)) {
-    defaultWhyHe = `חדשות על חוזים, שיתופי פעולה או השקות טכנולוגיות (${ticker}) מחזקות את הציפייה להגדלת הכנסות עתידית.`;
-    defaultOverreactionHe = 'אם מדובר בהסכם מסחרי מחייב עם לקוח גדול זו השפעה מהותית; אם זו שמועה ראשונית, ייתכן שהתגובה תתאזן.';
-    defaultRespondHe = 'לעקוב אחר מחיר המניה בימים הקרובים ולצרף לרשימת המעקב לבדיקת השפעה על הדוח הרבעוני הקרוב.';
+      ? `חשוב לבחון אם זו כותרת קצרת טווח או פגיעה ביתרון המרכזי של החברה: ${knownMoatHe}`
+      : 'אם תחזית הרווח לשנה הקרובה ירדה ממשית — הלחץ עלול להימשך מספר ימים; אם זו פרשנות זהירה בלבד, ייתכן שמדובר בתגובת יתר.';
+    defaultRespondHe = 'מומלץ להמתין להתייצבות מחזורי המסחר ולא למהר להגדיל חשיפה לפני שמתבררת ההשפעה הכספית.';
+  } else if (/upgrade|overweight|buy rating|top pick|price target|breakout|approv|investment|deal|contract|partnership/.test(lower)) {
+    defaultWhyHe = `דיווח חיובי ב-${source} על שדרוג אנליסטים, אישור מוצר או השקעה אסטרטגית של ${ticker} מחזק את הצפי לצמיחת ההכנסות.`;
+    defaultOverreactionHe = 'התגובה תיבחן לפי היקף התרומה הישירה להכנסות ולרווח התפעולי ברבעונים הקרובים.';
+    defaultRespondHe = 'לעקוב אחר המומנטום ולבדוק התאמה לרמת השווי ההוגן של המניה בתיק.';
   } else {
-    defaultWhyHe = `הדיווח היומי ב-${source} מרכז עניין סביב ${ticker}${hasLiveChg ? ` והמניה מגיבה כעת בתנועה של ${liveChgStr}` : ''}, כאשר השוק מעכל את המשמעות העסקית לימים הקרובים.`;
-    defaultOverreactionHe = 'בשעות הראשונות התגובה משקפת בעיקר סנטימנט מהיר של כותרות; ההשפעה האמיתית תימדד לפי שינוי בהכנסות וברווחיות.';
-    defaultRespondHe = 'להתעדכן בפרטי הכתבה, לבדוק האם זה משנה את הסיבה שבגללה המניה אצלך במעקב, ולהימנע מפעולה חפוזה.';
+    defaultWhyHe = `הדיווח היומי ב-${source} מרכז עניין סביב ${ticker}${hasLiveChg ? ` והמניה נעה כעת ב-${liveChgStr}` : ''}, כאשר השוק מעכל את ההשפעה העסקית לימים הקרובים.`;
+    defaultOverreactionHe = 'בשעות הראשונות התגובה משקפת בעיקר סנטימנט של כותרות; ההשפעה האמיתית תימדד לפי שינוי בתזרים וברווחיות.';
+    defaultRespondHe = 'להתעדכן בפרטי הכתבה, לוודא שאין שינוי מהותי בתזת ההשקעה ולהימנע מפעולה חפוזה.';
   }
 
   return {
@@ -1051,66 +1074,307 @@ function buildContextualReactionAnalysis(params: {
   };
 }
 
-// Map raw RSS news title/description to known market ticker
-function inferTickerFromHeadline(title: string, defaultTicker: string = 'SPY'): string {
-  const upper = title.toUpperCase();
-  const companyMap: [RegExp, string][] = [
-    [/\bNVIDIA\b|\bNVDA\b|JENSEN HUANG/i, 'NVDA'],
-    [/\bTESLA\b|\bTSLA\b|\bSPACEX\b/i, 'TSLA'],
-    [/\bMICROSOFT\b|\bMSFT\b|\bOUTLOOK\b|\bAZURE\b/i, 'MSFT'],
-    [/\bAMAZON\b|\bAMZN\b|\bAWS\b/i, 'AMZN'],
-    [/\bAPPLE\b|\bAAPL\b|\bIPHONE\b/i, 'AAPL'],
-    [/\bALPHABET\b|\bGOOGLE\b|\bGOOGL\b|\bWAYMO\b/i, 'GOOGL'],
-    [/\bMETA\b|\bFACEBOOK\b|\bINSTAGRAM\b/i, 'META'],
-    [/\bINTEL\b|\bINTC\b/i, 'INTC'],
-    [/\bAMD\b|\bADVANCED MICRO/i, 'AMD'],
-    [/\bBLOOM ENERGY\b|\b\bBE\b STOCK/i, 'BE'],
-    [/\bNOVA LTD\b|\bNVMI\b/i, 'NVMI'],
-    [/\bELI LILLY\b|\bLLY\b|\bZEPBOUND\b|\bMOUNJARO\b/i, 'LLY'],
-    [/\bPALANTIR\b|\bPLTR\b/i, 'PLTR'],
-    [/\bARM HOLDINGS\b|\bARM STOCK\b/i, 'ARM'],
-    [/\bSUPER MICRO\b|\bSMCI\b/i, 'SMCI'],
-    [/\bDELL\b/i, 'DELL'],
-    [/\bBOSTON SCIENTIFIC\b|\bBSX\b/i, 'BSX'],
-    [/\bCVS\b/i, 'CVS'],
-    [/\bJPMORGAN\b|\bJP MORGAN\b|\bJPM\b/i, 'JPM'],
-    [/\bBROADCOM\b|\bAVGO\b/i, 'AVGO'],
-    [/\bVALERO\b|\bVLO\b/i, 'VLO'],
-    [/\bINFLATION\b|\bFED\b|\bS&P 500\b|\bNASDAQ\b|\bTREASURY/i, 'SPY'],
-  ];
-  for (const [regex, ticker] of companyMap) {
-    if (regex.test(upper)) return ticker;
+// Curated company & ticker catalog for strict headline matching (no false-positive SPY dumps!)
+const TICKER_COMPANY_PATTERNS: { ticker: string; name: string; titleRegex: RegExp; queryHint: string }[] = [
+  { ticker: 'NVDA', name: 'NVIDIA Corporation', titleRegex: /\b(nvidia|nvda|blackwell|rubin|cuda)\b/i, queryHint: 'Nvidia OR NVDA' },
+  { ticker: 'AAPL', name: 'Apple Inc.', titleRegex: /\b(apple|aapl|iphone|ipad|macbook|ios)\b/i, queryHint: 'Apple OR AAPL' },
+  { ticker: 'MSFT', name: 'Microsoft Corporation', titleRegex: /\b(microsoft|msft|copilot)\b/i, queryHint: 'Microsoft OR MSFT' },
+  { ticker: 'AMZN', name: 'Amazon.com, Inc.', titleRegex: /\b(amazon|amzn|aws)\b/i, queryHint: 'Amazon OR AMZN' },
+  { ticker: 'GOOGL', name: 'Alphabet Inc.', titleRegex: /\b(alphabet|googl|goog|google|youtube|waymo)\b/i, queryHint: 'Alphabet OR Google OR GOOGL' },
+  { ticker: 'META', name: 'Meta Platforms, Inc.', titleRegex: /\b(meta platforms|meta['’]s|\bmeta\b.*\b(stock|shares|ai|investors|ads|facebook|instagram|teens|reels)|\bfacebook\b|\binstagram\b)\b/i, queryHint: '"Meta Platforms" OR Facebook' },
+  { ticker: 'TSLA', name: 'Tesla, Inc.', titleRegex: /\b(tesla|tsla|cybertruck|megapack|roadster)\b/i, queryHint: 'Tesla OR TSLA' },
+  { ticker: 'AVGO', name: 'Broadcom Inc.', titleRegex: /\b(broadcom|avgo|vmware)\b/i, queryHint: 'Broadcom OR AVGO' },
+  { ticker: 'AMD', name: 'Advanced Micro Devices, Inc.', titleRegex: /\b(amd|advanced micro devices|instinct)\b/i, queryHint: 'AMD stock' },
+  { ticker: 'TSM', name: 'Taiwan Semiconductor Manufacturing Co.', titleRegex: /\b(tsmc|taiwan semiconductor|\btsm\b)\b/i, queryHint: 'TSMC OR TSM' },
+  { ticker: 'ASML', name: 'ASML Holding N.V.', titleRegex: /\b(asml)\b/i, queryHint: 'ASML' },
+  { ticker: 'INTC', name: 'Intel Corporation', titleRegex: /\b(intel|intc)\b/i, queryHint: 'Intel OR INTC' },
+  { ticker: 'ARM', name: 'Arm Holdings plc', titleRegex: /\b(arm holdings|\barm\b.*\b(stock|shares|chip|semiconductor))\b/i, queryHint: '"Arm Holdings"' },
+  { ticker: 'MU', name: 'Micron Technology, Inc.', titleRegex: /\b(micron|\bmu\b.*\b(stock|shares|memory|hbm|earnings))\b/i, queryHint: '"Micron Technology"' },
+  { ticker: 'QCOM', name: 'Qualcomm Incorporated', titleRegex: /\b(qualcomm|qcom)\b/i, queryHint: 'Qualcomm OR QCOM' },
+  { ticker: 'LRCX', name: 'Lam Research Corporation', titleRegex: /\b(lam research|lrcx)\b/i, queryHint: '"Lam Research"' },
+  { ticker: 'AMAT', name: 'Applied Materials, Inc.', titleRegex: /\b(applied materials|amat)\b/i, queryHint: '"Applied Materials"' },
+  { ticker: 'ANET', name: 'Arista Networks, Inc.', titleRegex: /\b(arista networks|anet)\b/i, queryHint: '"Arista Networks"' },
+  { ticker: 'SMCI', name: 'Super Micro Computer, Inc.', titleRegex: /\b(super micro|supermicro|smci)\b/i, queryHint: '"Super Micro" OR SMCI' },
+  { ticker: 'DELL', name: 'Dell Technologies Inc.', titleRegex: /\b(dell technologies|\bdell\b.*\b(stock|shares|ai|server|earnings))\b/i, queryHint: '"Dell Technologies"' },
+  { ticker: 'LLY', name: 'Eli Lilly and Company', titleRegex: /\b(eli lilly|lilly['’]?s|\blly\b|mounjaro|zepbound)\b/i, queryHint: '"Eli Lilly"' },
+  { ticker: 'NVO', name: 'Novo Nordisk A/S', titleRegex: /\b(novo nordisk|\bnvo\b|ozempic|wegovy)\b/i, queryHint: '"Novo Nordisk"' },
+  { ticker: 'UNH', name: 'UnitedHealth Group Incorporated', titleRegex: /\b(unitedhealth|optum|\bunh\b)\b/i, queryHint: 'UnitedHealth OR UNH' },
+  { ticker: 'CVS', name: 'CVS Health Corporation', titleRegex: /\b(cvs health|\bcvs\b|caremark|aetna)\b/i, queryHint: '"CVS Health"' },
+  { ticker: 'BSX', name: 'Boston Scientific Corporation', titleRegex: /\b(boston scientific|\bbsx\b|farapulse)\b/i, queryHint: '"Boston Scientific"' },
+  { ticker: 'JNJ', name: 'Johnson & Johnson', titleRegex: /\b(johnson & johnson|\bjnj\b)\b/i, queryHint: '"Johnson & Johnson"' },
+  { ticker: 'PFE', name: 'Pfizer Inc.', titleRegex: /\b(pfizer|\bpfe\b)\b/i, queryHint: 'Pfizer OR PFE' },
+  { ticker: 'MRK', name: 'Merck & Co., Inc.', titleRegex: /\b(merck|\bmrk\b)\b/i, queryHint: 'Merck stock' },
+  { ticker: 'PLTR', name: 'Palantir Technologies Inc.', titleRegex: /\b(palantir|pltr)\b/i, queryHint: 'Palantir OR PLTR' },
+  { ticker: 'CRWD', name: 'CrowdStrike Holdings, Inc.', titleRegex: /\b(crowdstrike|crwd)\b/i, queryHint: 'CrowdStrike OR CRWD' },
+  { ticker: 'PANW', name: 'Palo Alto Networks, Inc.', titleRegex: /\b(palo alto networks|panw)\b/i, queryHint: '"Palo Alto Networks"' },
+  { ticker: 'CHKP', name: 'Check Point Software Technologies Ltd.', titleRegex: /\b(check point|chkp)\b/i, queryHint: '"Check Point Software"' },
+  { ticker: 'ITRN', name: 'Ituran Location and Control Ltd.', titleRegex: /\b(ituran|itrn)\b/i, queryHint: 'Ituran OR ITRN' },
+  { ticker: 'NVMI', name: 'Nova Ltd.', titleRegex: /\b(nova ltd|nvmi)\b/i, queryHint: '"Nova Ltd" OR NVMI' },
+  { ticker: 'BE', name: 'Bloom Energy Corporation', titleRegex: /\b(bloom energy|\(nyse:be\)|\(be\)|\bbe stock\b)\b/i, queryHint: '"Bloom Energy"' },
+  { ticker: 'CYBR', name: 'CyberArk Software Ltd.', titleRegex: /\b(cyberark|cybr)\b/i, queryHint: 'CyberArk OR CYBR' },
+  { ticker: 'ORCL', name: 'Oracle Corporation', titleRegex: /\b(oracle|orcl)\b/i, queryHint: 'Oracle OR ORCL' },
+  { ticker: 'CRM', name: 'Salesforce, Inc.', titleRegex: /\b(salesforce|\bcrm\b)\b/i, queryHint: 'Salesforce OR CRM' },
+  { ticker: 'ADBE', name: 'Adobe Inc.', titleRegex: /\b(adobe|adbe)\b/i, queryHint: 'Adobe OR ADBE' },
+  { ticker: 'NOW', name: 'ServiceNow, Inc.', titleRegex: /\b(servicenow|\(nyse:now\))\b/i, queryHint: 'ServiceNow' },
+  { ticker: 'SNOW', name: 'Snowflake Inc.', titleRegex: /\b(snowflake|\(nyse:snow\)|\bsnow stock\b)\b/i, queryHint: 'Snowflake stock' },
+  { ticker: 'NFLX', name: 'Netflix, Inc.', titleRegex: /\b(netflix|nflx)\b/i, queryHint: 'Netflix OR NFLX' },
+  { ticker: 'DIS', name: 'The Walt Disney Company', titleRegex: /\b(walt disney|disney|\bdis\b.*\b(stock|shares|earnings))\b/i, queryHint: 'Disney stock' },
+  { ticker: 'SPOT', name: 'Spotify Technology S.A.', titleRegex: /\b(spotify|spot)\b/i, queryHint: 'Spotify stock' },
+  { ticker: 'UBER', name: 'Uber Technologies, Inc.', titleRegex: /\b(uber technologies|\buber\b.*\b(stock|shares|earnings|robotaxi|delivery))\b/i, queryHint: '"Uber Technologies"' },
+  { ticker: 'BKNG', name: 'Booking Holdings Inc.', titleRegex: /\b(booking holdings|booking\.com|bkng)\b/i, queryHint: '"Booking Holdings"' },
+  { ticker: 'ABNB', name: 'Airbnb, Inc.', titleRegex: /\b(airbnb|abnb)\b/i, queryHint: 'Airbnb stock' },
+  { ticker: 'SHOP', name: 'Shopify Inc.', titleRegex: /\b(shopify|\(nyse:shop\)|\(nasdaq:shop\)|shop stock)\b/i, queryHint: 'Shopify stock' },
+  { ticker: 'COIN', name: 'Coinbase Global, Inc.', titleRegex: /\b(coinbase|coin)\b/i, queryHint: 'Coinbase stock' },
+  { ticker: 'HOOD', name: 'Robinhood Markets, Inc.', titleRegex: /\b(robinhood|\bhood\b.*\b(stock|shares|earnings|crypto))\b/i, queryHint: 'Robinhood stock' },
+  { ticker: 'SOFI', name: 'SoFi Technologies, Inc.', titleRegex: /\b(sofi)\b/i, queryHint: 'SoFi stock' },
+  { ticker: 'PYPL', name: 'PayPal Holdings, Inc.', titleRegex: /\b(paypal|pypl)\b/i, queryHint: 'PayPal OR PYPL' },
+  { ticker: 'V', name: 'Visa Inc.', titleRegex: /\b(visa['’]?s|\bvisa\b.*\b(stock|shares|earnings|payment|shopping|cmo|cyber|card)|\(nyse:v\))\b/i, queryHint: '"Visa" stock' },
+  { ticker: 'MA', name: 'Mastercard Incorporated', titleRegex: /\b(mastercard|\(nyse:ma\))\b/i, queryHint: 'Mastercard stock' },
+  { ticker: 'JPM', name: 'JPMorgan Chase & Co.', titleRegex: /\b(jpmorgan|jp morgan|j\.p\. morgan|\bjpm\b)\b/i, queryHint: 'JPMorgan OR JPM' },
+  { ticker: 'GS', name: 'The Goldman Sachs Group, Inc.', titleRegex: /\b(goldman sachs)\b/i, queryHint: '"Goldman Sachs"' },
+  { ticker: 'MS', name: 'Morgan Stanley', titleRegex: /\b(morgan stanley['’]?s|\bmorgan stanley\b.*\b(stock|shares|earnings|profit|ceo))\b/i, queryHint: '"Morgan Stanley" stock' },
+  { ticker: 'BLK', name: 'BlackRock, Inc.', titleRegex: /\b(blackrock|\bblk\b)\b/i, queryHint: 'BlackRock' },
+  { ticker: 'BRK.B', name: 'Berkshire Hathaway Inc.', titleRegex: /\b(berkshire hathaway|buffett|brk\.b)\b/i, queryHint: '"Berkshire Hathaway"' },
+  { ticker: 'WMT', name: 'Walmart Inc.', titleRegex: /\b(walmart|wmt)\b/i, queryHint: 'Walmart OR WMT' },
+  { ticker: 'TGT', name: 'Target Corporation', titleRegex: /\b(target['’]?s|\btarget shares\b|\btarget corp|\(nyse:tgt\)|\btgt\b.*\b(earnings|sales|guidance))\b/i, queryHint: '"Target Corporation" OR "Target shares"' },
+  { ticker: 'LOW', name: "Lowe's Companies, Inc.", titleRegex: /\b(lowe['’]s|\(nyse:low\))\b/i, queryHint: '"Lowe\'s" stock' },
+  { ticker: 'HD', name: 'The Home Depot, Inc.', titleRegex: /\b(home depot|\(nyse:hd\))\b/i, queryHint: '"Home Depot"' },
+  { ticker: 'COST', name: 'Costco Wholesale Corporation', titleRegex: /\b(costco|\bcost\b.*\b(stock|shares|earnings|sales))\b/i, queryHint: 'Costco' },
+  { ticker: 'MCD', name: "McDonald's Corporation", titleRegex: /\b(mcdonald['’]?s|\bmcd\b)\b/i, queryHint: "McDonald's stock" },
+  { ticker: 'SBUX', name: 'Starbucks Corporation', titleRegex: /\b(starbucks|sbux)\b/i, queryHint: 'Starbucks OR SBUX' },
+  { ticker: 'NKE', name: 'NIKE, Inc.', titleRegex: /\b(nike|\bnke\b)\b/i, queryHint: 'Nike stock' },
+  { ticker: 'KO', name: 'The Coca-Cola Company', titleRegex: /\b(coca-cola|coca cola)\b/i, queryHint: 'Coca-Cola stock' },
+  { ticker: 'PEP', name: 'PepsiCo, Inc.', titleRegex: /\b(pepsico|pepsi)\b/i, queryHint: 'PepsiCo' },
+  { ticker: 'BA', name: 'The Boeing Company', titleRegex: /\b(boeing|\(nyse:ba\))\b/i, queryHint: 'Boeing' },
+  { ticker: 'LMT', name: 'Lockheed Martin Corporation', titleRegex: /\b(lockheed martin|\blmt\b)\b/i, queryHint: '"Lockheed Martin"' },
+  { ticker: 'CAT', name: 'Caterpillar Inc.', titleRegex: /\b(caterpillar|\(nyse:cat\))\b/i, queryHint: 'Caterpillar stock' },
+  { ticker: 'XOM', name: 'Exxon Mobil Corporation', titleRegex: /\b(exxonmobil|exxon|\bxom\b)\b/i, queryHint: 'ExxonMobil' },
+  { ticker: 'CVX', name: 'Chevron Corporation', titleRegex: /\b(chevron|\bcvx\b)\b/i, queryHint: 'Chevron' },
+  { ticker: 'VLO', name: 'Valero Energy Corporation', titleRegex: /\b(valero|\bvlo\b)\b/i, queryHint: 'Valero Energy' },
+  { ticker: 'NEE', name: 'NextEra Energy, Inc.', titleRegex: /\b(nextera energy|\bnee\b)\b/i, queryHint: '"NextEra Energy"' },
+];
+
+const KNOWN_COMPANY_NAME_MAP: Record<string, string> = Object.fromEntries(
+  TICKER_COMPANY_PATTERNS.map((p) => [p.ticker, p.name])
+);
+
+// Strict noise / clickbait / non-actionable SEO article filter
+function isIrrelevantOrSpamHeadline(title: string, snippet: string = '', source: string = '', strictDailyMode: boolean = true): boolean {
+  const t = (title || '').trim();
+  const s = (source || '').trim();
+  const combined = `${t} ${snippet || ''} ${s}`.toLowerCase();
+
+  if (t.length < 18) return true;
+
+  // 1. SEO ticker quote pages & robo-forecast spam (never real news)
+  if (/stock price,\s*news,\s*quote\s*(?:&|and)\s*history/i.test(t)) return true;
+  if (/stock price forecast\.\s*should you buy/i.test(t)) return true;
+  if (/stock forecast\s*(?:&|and)\s*analyst predictions/i.test(t)) return true;
+  if (/learn to evaluate\s*\(/i.test(t)) return true;
+  if (/6-k\s*(?:&|and)\s*sec filings/i.test(t)) return true;
+  if (/\bchecks the garp boxes\b/i.test(t)) return true;
+  if (/(stockinvest\.us|walletinvestor|coincodex|govcapital|macroaxis|stock traders daily)/i.test(combined)) return true;
+
+  // 2. Clickbait listicles, hypothetical backtests, private startup fundraises, and vendor PR noise
+  if (/\b\d+\s+(?:[a-z]+\s+){0,2}(?:best|top|cheap|great|high-yield|dividend|growth|ai|infrastructure)\s+stocks\b/i.test(t)) return true;
+  if (/\bbest stocks to buy\b|\btop stocks to buy\b|\bstocks to buy before\b|\bi['’]d buy it now\b|\bi['’]d buy when\b/i.test(t)) return true;
+  if (/\bshould you (?:invest|buy)\s+\$[\d,]+/i.test(t)) return true;
+  if (/\bif you (?:had )?invested \$[\d,]+/i.test(t)) return true;
+  if (/\bhere'?s my price target\b/i.test(t)) return true;
+  if (/\bquiet winner\b/i.test(t)) return true;
+  if (/\bseries [a-e] financing\b|\bseed round\b/i.test(t)) return true;
+  if (/\bannounces support for\b/i.test(t)) return true;
+  if (/\bmexc\b|\bmemecoin\b|\bpresale\b|\bairdrop\b/i.test(combined)) return true;
+  if (/\bwhy young people across the world\b/i.test(t)) return true;
+
+  // 3. Stricter filters for the Daily Breaking News stream (keep signal super crisp)
+  if (strictDailyMode) {
+    if (/\binsider sells [\d,]+ shares\b/i.test(t)) return true;
+    if (/\binsider sold shares\b/i.test(t)) return true;
+    if (/\bunder a trading plan,.*sold [\d,]+ shares\b/i.test(combined)) return true;
+    if (/\bearnings call summary\b/i.test(t) && !/(nvidia|apple|microsoft|alphabet|amazon|meta|tesla|broadcom|amd|target|lowe|palantir|costco)/i.test(t)) return true;
+    if (/\bwhich is the tech stock now\?/i.test(t)) return true;
+    if (/\bhere'?s why\b.*\bsays analyst\b/i.test(t)) return true;
+    if (/\bhere'?s why it'?s time to buy\b/i.test(t)) return true;
   }
-  return defaultTicker;
+
+  return false;
 }
 
-function formatRssPublishedTime(pubDateStr: string): { timeLabel: string; dateLabel: string; timestampMs: number } {
-  const parsed = pubDateStr ? Date.parse(pubDateStr) : NaN;
-  if (isNaN(parsed)) {
-    const ilNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Jerusalem' }));
-    return {
-      timeLabel: ilNow.toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit' }),
-      dateLabel: 'היום • מבזק חי',
-      timestampMs: Date.now(),
-    };
+// Strict subject classifier: returns matching company/ticker OR 'SPY' only for genuine market/macro news, else null
+function inferTickerFromHeadline(title: string): string | null {
+  const t = (title || '').trim();
+  if (!t) return null;
+
+  // 0. Market live-coverage / closing-bell recaps belong strictly to macro 'SPY' (even if one retailer is mentioned in passing)
+  if (/^(?:stock market today|markets? live|closing bell|opening bell|morning brief)\s*:/i.test(t)) {
+    return 'SPY';
   }
-  const diffMin = Math.max(0, Math.floor((Date.now() - parsed) / 60000));
+
+  // 1. Find earliest primary company match by character position in headline
+  let bestMatch: { ticker: string; index: number } | null = null;
+  for (const entry of TICKER_COMPANY_PATTERNS) {
+    const m = entry.titleRegex.exec(t);
+    if (m) {
+      if (!bestMatch || m.index < bestMatch.index) {
+        bestMatch = { ticker: entry.ticker, index: m.index };
+      }
+    }
+  }
+  if (bestMatch) return bestMatch.ticker;
+
+  // 2. Check explicit exchange-tagged ticker like (NASDAQ:CHKP) or (NYSE:V) present in our known universe
+  const tagMatch = t.match(/\((?:NASDAQ|NYSE|AMEX)\s*:\s*([A-Z]{1,5}(?:\.[A-Z])?)\)/i);
+  if (tagMatch) {
+    const sym = tagMatch[1].toUpperCase();
+    if (GLOBAL_STOCK_KNOWLEDGE[sym] || KNOWN_COMPANY_NAME_MAP[sym] || KNOWN_CATALOG_PRICES[sym]) {
+      return sym;
+    }
+  }
+
+  // 3. Genuine US macro / index / Fed / Wall Street headlines -> 'SPY'
+  if (
+    /\b(s&p\s*500|nasdaq|dow jones|wall street|federal reserve|fed['’]?s|powell|waller|fomc|rate hike|rate cut|interest rates?|inflation|cpi\b|pce\b|treasury yields?|jobs report|payrolls|tariffs?|stock market|equities|market rally|market sell-?off)\b/i.test(
+      t
+    )
+  ) {
+    return 'SPY';
+  }
+
+  // Anything else (unverified tiny foreign/private stocks or off-topic headlines) is rejected cleanly
+  return null;
+}
+
+function formatRssPublishedTime(
+  pubDateStr: string
+): { timeLabel: string; dateLabel: string; timestampMs: number; ageHours: number; isTodayCalendar: boolean } | null {
+  const parsed = pubDateStr ? Date.parse(pubDateStr) : NaN;
+  if (isNaN(parsed) || parsed > Date.now() + 3600000) {
+    return null;
+  }
+
+  const nowMs = Date.now();
+  const ageHours = Math.max(0, (nowMs - parsed) / 3600000);
+  const diffMin = Math.max(0, Math.floor((nowMs - parsed) / 60000));
+
+  const todayKey = getTodayDateKey();
+  const articleDateKey = getDateKeyForMs(parsed);
+  const isTodayCalendar = articleDateKey === todayKey;
+
   const ilStr = new Date(parsed).toLocaleTimeString('he-IL', {
     hour: '2-digit',
     minute: '2-digit',
     timeZone: 'Asia/Jerusalem',
   });
 
+  const dateFormattedHe = new Date(parsed).toLocaleDateString('he-IL', {
+    day: '2-digit',
+    month: '2-digit',
+    timeZone: 'Asia/Jerusalem',
+  });
+
   let relHe = '';
   if (diffMin < 2) relHe = 'עכשיו • עדכון חי';
-  else if (diffMin < 60) relHe = `לפני ${diffMin} דק' • היום`;
-  else if (diffMin < 1440) relHe = `לפני ${Math.floor(diffMin / 60)} שעות • היום`;
-  else relHe = `${new Date(parsed).toLocaleDateString('he-IL')}`;
+  else if (diffMin < 60 && isTodayCalendar) relHe = `לפני ${diffMin} דק' • היום`;
+  else if (isTodayCalendar) {
+    const hrs = Math.max(1, Math.floor(diffMin / 60));
+    relHe = hrs === 1 ? 'לפני שעה • היום' : hrs === 2 ? 'לפני שעתיים • היום' : `לפני ${hrs} שעות • היום`;
+  }
+  else if (ageHours < 48) relHe = `אתמול (${dateFormattedHe})`;
+  else relHe = `${dateFormattedHe}`;
 
   return {
     timeLabel: ilStr,
     dateLabel: relHe,
     timestampMs: parsed,
+    ageHours,
+    isTodayCalendar,
+  };
+}
+
+// Clear Hebrew translation & contextual summary generator (works deterministically when Gemini key is unavailable or rate-limited)
+function formatDeterministicHebrewNews(params: {
+  rawTitle: string;
+  snippet: string;
+  ticker: string;
+  companyName: string;
+  sourceName: string;
+  dateLabel: string;
+  timeLabel: string;
+  sentiment?: 'BULLISH' | 'BEARISH' | 'NEUTRAL';
+}): { headlineHe: string; summaryHe: string } {
+  const { rawTitle, snippet, ticker, companyName, sourceName, dateLabel, timeLabel, sentiment } = params;
+  const escapedSource = sourceName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const cleanTitle = rawTitle
+    .replace(new RegExp(`\\s*[-–|]\\s*${escapedSource}(?:\\.com)?\\s*$`, 'i'), '')
+    .replace(/\s*[-–|]\s*(Yahoo Finance|CNBC|Reuters|Bloomberg(?:\.com)?|Barron'?s|WSJ|The Wall Street Journal|Forbes|MarketWatch|Seeking Alpha|Investor'?s Business Daily|IBD|Barchart\.com|ChartMill|MarketBeat|Stock Titan|Axios|TradingView|marketscreener\.com|MSSP Alert|Zawya).*$/i, '')
+    .trim();
+  const cleanSnippet = (snippet || '')
+    .replace(new RegExp(`\\s*[-–|]?\\s*${escapedSource}(?:\\.com)?\\s*$`, 'i'), '')
+    .trim();
+  const lower = cleanTitle.toLowerCase();
+  const companyLabel = ticker === 'SPY' ? 'וול סטריט והפד' : `${companyName.replace(/,?\s*(Inc\.?|Corp\.?|Corporation|Ltd\.?|Limited|Holdings|Group|plc).*$/i, '').trim()} (${ticker})`;
+  const emoji = sentiment === 'BEARISH' ? '🔴' : sentiment === 'BULLISH' ? '🟢' : '🔵';
+
+  // Specific high-frequency market & macro event patterns translated naturally to Hebrew
+  if (ticker === 'SPY' && /(waller|fed|federal reserve|fomc|powell)/.test(lower) && /(rate hike|half-point|rates|minutes|inflation|next moves)/.test(lower)) {
+    const isHalfPoint = /half-point|50\s*bps|shock/i.test(lower);
+    const headlineHe = isHalfPoint
+      ? `🔴 וול סטריט וריבית (${sourceName}): בכיר הפד מאותת כי הבנק המרכזי עשוי להפתיע בהעלאת ריבית של 0.5%`
+      : `🔴 מאקרו והפדרל ריזרב (${sourceName}): המתיחות סביב פרוטוקול הפד ותוואי הריבית מכבידה על המדדים`;
+    const summaryHe = isHalfPoint
+      ? `חבר מועצת הפדרל ריזרב כריסטופר וולר הזהיר כי המשך האינפלציה עשוי לחייב צעד חד של העלאת ריבית בחצי אחוז, מה שמייצר זהירות בשוקי המניות והאג"ח.`
+      : `פרוטוקול החלטת הריבית של הפד והציפיות לצעדי הבנק המרכזי מרכזים עניין בוול סטריט ומעיבים על סנטימנט המשקיעים (${cleanTitle}).`;
+    return { headlineHe, summaryHe };
+  }
+
+  if (/jensen|huang/.test(lower) && /without jensen|resignation|uncertainty|come.?back|without/.test(lower)) {
+    const isScandalTimeline = /timeline|scandal|potential comeback/i.test(lower);
+    const isUncertainty = /uncertainty|who and what comes next|caution|without jensen/i.test(lower);
+    const headlineHe = isScandalTimeline
+      ? `🔴 אנבידיה (NVDA • ${sourceName}): סקירת השתלשלות פרישת המנכ"ל ג'נסן הואנג והתרחישים להמשך`
+      : isUncertainty
+      ? `🟠 אנבידיה (NVDA • ${sourceName}): אחרי עזיבת ג'נסן הואנג — אנליסטים מעריכים המשך תנודתיות למרות דוח חזק`
+      : `🔴 אנבידיה (NVDA • ${sourceName}): התאמת השוק לעידן שאחרי ג'נסן הואנג`;
+    const summaryHe = `הדיווח ב-${sourceName} סוקר את תגובת וול סטריט לשינוי בהנהגת אנבידיה לאחר עזיבת ג'נסן הואנג: אף שתוצאות הרבעון השלישי והביקוש לשבבי AI נותרו חזקים, המשקיעים ממתינים לבהירות לגבי ההנהגה הבאה.`;
+    return { headlineHe, summaryHe };
+  }
+
+  if (/anthropic/.test(lower) && /nvidia|\$10\s*billion/i.test(lower)) {
+    return {
+      headlineHe: `🟢 אנבידיה (NVDA • ${sourceName}): השקעה מתוכננת של 10 מיליארד דולר ב-Anthropic מעמיקה את האחיזה ב-AI`,
+      summaryHe: `אנבידיה מקדמת השקעה אסטרטגית של כ-10 מיליארד דולר בחברת הבינה המלאכותית Anthropic, מה שמחזק את הביקוש העתידי לתשתיות המחשוב והשבבים שלה.`,
+    };
+  }
+
+  if (/anthropic/.test(lower) && /(amazon|alphabet|google)/i.test(lower)) {
+    return {
+      headlineHe: `🟢 אמזון ואלפאבית (${ticker} • ${sourceName}): צפויות להחזיק מעל 28% מ-Anthropic לאחר ההנפקה`,
+      summaryHe: `דיווח מרכז עניין מוסדי לקראת הנפקתה הצפויה של Anthropic: האחזקות האסטרטגיות של אמזון (AMZN) וגוגל (GOOGL) עשויות להניב רווח הוני משמעותי וביקושי ענן מתמשכים.`,
+    };
+  }
+
+  if (sentiment === 'BULLISH' || /(rises?|surges?|jumps?|climbs?|soars?|beats?|hikes? guidance|raises? outlook|strong.*sales)/.test(lower)) {
+    const headlineHe = `🟢 ${companyLabel} (${sourceName}): עליות ורוח גבית בעקבות תוצאות חזקות, שת"פ או העלאת תחזית`;
+    const summaryHe = `לפי דיווח ב-${sourceName} (${dateLabel} • ${timeLabel}): ${cleanTitle}. המשקיעים מגיבים לשיפור במומנטום ההכנסות והעסקים הצפוי.`;
+    return { headlineHe, summaryHe };
+  }
+
+  if (sentiment === 'BEARISH' || /(downgrade|slumps?|plunges?|falls?|drops?|down \d+|sinks?|sputters?|drag down|caution|warning|probe|antitrust|at risk|anti-fraud|hooks? teens)/.test(lower)) {
+    const headlineHe = `🔴 ${companyLabel} (${sourceName}): זהירות ולחץ בעקבות אזהרת סיכון, ביקורת רגולטורית או חולשה`;
+    const summaryHe = `דיווח ב-${sourceName} (${dateLabel} • ${timeLabel}) מצביע על אתגר או זהירות בשוק סביב ${companyLabel}: ${cleanTitle}.`;
+    return { headlineHe, summaryHe };
+  }
+
+  if (/(approves?|approval|fedramp|malware|blocked|breakout|ai agents|marketing|expand|investment|deal|azure|sase|earnings:\s*revenue estimate)/.test(lower)) {
+    const headlineHe = `${emoji} ${companyLabel} (${sourceName}): עדכון עסקי, אישור מוצר או התפתחות אסטרטגית`;
+    const summaryHe = `עדכון שוטף מ-${sourceName} (${dateLabel} • ${timeLabel}) על פעילות ${companyLabel}: ${cleanTitle}.`;
+    return { headlineHe, summaryHe };
+  }
+
+  return {
+    headlineHe: `${emoji} ${companyLabel} (${sourceName}): עדכון שוק — ${cleanTitle}`,
+    summaryHe: `דיווח מהשוק (${sourceName} • ${dateLabel}, ${timeLabel}): ${cleanSnippet && cleanSnippet.length > 20 && cleanSnippet !== cleanTitle ? cleanSnippet.slice(0, 220) : cleanTitle}.`,
   };
 }
 
@@ -1118,21 +1382,24 @@ function formatRssPublishedTime(pubDateStr: string): { timeLabel: string; dateLa
 async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void> {
   const todayKey = getTodayDateKey();
   const dayRolledOver = lastRssSyncDateKey !== todayKey;
-  if (!force && !dayRolledOver && Date.now() - lastRssNewsSyncTime < 90000) return;
+  if (!force && !dayRolledOver && cachedPremarketNews.length > 0 && Date.now() - lastRssNewsSyncTime < 90000) return;
   if (dayRolledOver) {
     dailyAiNewsCache.clear();
   }
 
   try {
-    const tickerBatch1 = 'TSLA,AAPL,MSFT,GOOGL,AMZN,META,NVMI,BE,INTC';
-    const tickerBatch2 = 'AMD,LLY,PLTR,ARM,BSX,CVS,JPM,VLO,AVGO,SPY';
-
     const rssUrls = [
-      `https://feeds.finance.yahoo.com/rss/2.0/headline?s=NVDA&region=US&lang=en-US`,
-      `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${tickerBatch1}&region=US&lang=en-US`,
-      `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${tickerBatch2}&region=US&lang=en-US`,
-      `https://news.google.com/rss/search?q=Nvidia+CEO+OR+Jensen+Huang+OR+Nasdaq+breaking+when:1d&hl=en-US&gl=US&ceid=US:en`,
-      `https://news.google.com/rss/search?q=Wall+Street+stock+market+breaking+news+when:1d&hl=en-US&gl=US&ceid=US:en`,
+      // Clean high-signal CNBC financial RSS streams
+      `https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839069`, // CNBC Investing
+      `https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135`, // CNBC Earnings
+      `https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258`, // CNBC Markets
+      // Targeted Google News 24h market & mega-cap streams
+      `https://news.google.com/rss/search?q=(%22S%26P+500%22+OR+Nasdaq+OR+%22Federal+Reserve%22+OR+%22Wall+Street%22)+when:1d&hl=en-US&gl=US&ceid=US:en`,
+      `https://news.google.com/rss/search?q=(Nvidia+OR+Apple+OR+Microsoft+OR+Tesla+OR+Amazon+OR+Meta+OR+Alphabet+OR+Broadcom+OR+AMD)+(stock+OR+shares+OR+earnings+OR+AI)+when:1d&hl=en-US&gl=US&ceid=US:en`,
+      `https://news.google.com/rss/search?q=(earnings+OR+%22raises+outlook%22+OR+%22hikes+guidance%22+OR+upgrades+OR+downgrades)+(stock+OR+shares)+when:1d&hl=en-US&gl=US&ceid=US:en`,
+      // Yahoo Finance RSS strictly filtered downstream by company/ticker classifier
+      `https://feeds.finance.yahoo.com/rss/2.0/headline?s=NVDA,AAPL,MSFT,GOOGL,AMZN,META,TSLA,AVGO,AMD,LLY&region=US&lang=en-US`,
+      `https://feeds.finance.yahoo.com/rss/2.0/headline?s=V,JPM,UNH,COST,PLTR,INTC,CHKP,ITRN,NVMI,BE&region=US&lang=en-US`,
     ];
 
     const responses = await Promise.allSettled(
@@ -1154,32 +1421,51 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
       pubDate: string;
       source: string;
       snippet: string;
+      ticker: string;
       timestampMs: number;
+      ageHours: number;
       timeLabel: string;
       dateLabel: string;
     }[] = [];
 
     const seenTitles = new Set<string>();
-    for (const r of responses) {
+    const defaultSourceFromUrl = (url: string) =>
+      url.includes('cnbc.com') ? 'CNBC' : url.includes('yahoo.com') ? 'Yahoo Finance' : 'Wall Street Wire';
+
+    for (let urlIdx = 0; urlIdx < responses.length; urlIdx++) {
+      const r = responses[urlIdx];
       if (r.status !== 'fulfilled' || !r.value) continue;
       const xml = r.value;
       const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
-      for (const itemXml of itemMatches.slice(0, 15)) {
-        const titleMatch = itemXml.match(/<title>(.*?)<\/title>/);
-        const linkMatch = itemXml.match(/<link>(.*?)<\/link>/);
-        const pubDateMatch = itemXml.match(/<pubDate>(.*?)<\/pubDate>/);
-        const sourceMatch = itemXml.match(/<source[^>]*>(.*?)<\/source>/);
-        const descMatch = itemXml.match(/<description>(.*?)<\/description>/);
+      for (const itemXml of itemMatches.slice(0, 18)) {
+        const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/);
+        const linkMatch = itemXml.match(/<link>([\s\S]*?)<\/link>/);
+        const pubDateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/);
+        const sourceMatch = itemXml.match(/<source[^>]*>([\s\S]*?)<\/source>/);
+        const descMatch = itemXml.match(/<description>([\s\S]*?)<\/description>/);
 
         const rawTitle = titleMatch ? cleanHtmlSnippet(titleMatch[1]) : '';
-        if (!rawTitle || rawTitle.length < 15 || seenTitles.has(rawTitle.toLowerCase())) continue;
-        seenTitles.add(rawTitle.toLowerCase());
+        if (!rawTitle) continue;
+        const normKey = rawTitle.toLowerCase().replace(/\s*[-–|]\s*[^-–|]+$/, '').trim();
+        if (seenTitles.has(normKey)) continue;
 
-        const link = linkMatch ? linkMatch[1].trim() : 'https://finance.yahoo.com';
-        const rawSource = sourceMatch ? cleanHtmlSnippet(sourceMatch[1]) : 'Yahoo Finance Wire';
+        const rawSource = sourceMatch ? cleanHtmlSnippet(sourceMatch[1]) : defaultSourceFromUrl(rssUrls[urlIdx]);
         const snippet = descMatch ? cleanHtmlSnippet(descMatch[1]) : rawTitle;
-        const pubDate = pubDateMatch ? pubDateMatch[1] : '';
+
+        // Strictly reject spam, quote SEO bots, clickbait listicles & private micro-PR
+        if (isIrrelevantOrSpamHeadline(rawTitle, snippet, rawSource, true)) continue;
+
+        // Strictly verify known stock OR genuine US macro/index relevance (zero random SPY fallbacks!)
+        const matchedTicker = inferTickerFromHeadline(rawTitle);
+        if (!matchedTicker) continue;
+
+        // Strictly require a valid recent publication timestamp (drop old/stale news > 72h)
+        const pubDate = pubDateMatch ? cleanHtmlSnippet(pubDateMatch[1]) : '';
         const timing = formatRssPublishedTime(pubDate);
+        if (!timing || timing.ageHours > 72) continue;
+
+        seenTitles.add(normKey);
+        const link = linkMatch ? cleanHtmlSnippet(linkMatch[1]) : 'https://finance.yahoo.com';
 
         rawItems.push({
           title: rawTitle,
@@ -1187,7 +1473,9 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
           pubDate,
           source: rawSource,
           snippet,
+          ticker: matchedTicker,
           timestampMs: timing.timestampMs,
+          ageHours: timing.ageHours,
           timeLabel: timing.timeLabel,
           dateLabel: timing.dateLabel,
         });
@@ -1196,61 +1484,58 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
 
     if (rawItems.length === 0) return;
 
-    // Score breaking impact + recency so mega breaking news (CEO resignation / major downgrade / market shock) from today ranks alongside newest wires
-    const scoredItems = rawItems.map((it) => {
-      const ageHours = Math.max(0, (Date.now() - it.timestampMs) / 3600000);
-      const isMajorLeadershipShock = /resign(s|ed|ation)?|step(s|ped)? down|departs?|ouster|ousted|without jensen|scandal/i.test(it.title);
-      const isSharpMove = /sinks? \d|plunges?|crashes?|tumbles?|downgrade|slashes target|inflation.*shock/i.test(it.title);
-      const priorityBoostMs = (isMajorLeadershipShock && ageHours < 14 ? 4 * 3600 * 1000 : 0) + (isSharpMove && ageHours < 8 ? 1.5 * 3600 * 1000 : 0);
-      return { it, scoreMs: it.timestampMs + priorityBoostMs, isMajorLeadershipShock };
+    // Prefer fresh <= 36h daily wires; only include 36-72h weekend/Friday wires if daily count < 8
+    const dailyFresh = rawItems.filter((it) => it.ageHours <= 36);
+    const pool = dailyFresh.length >= 8 ? dailyFresh : rawItems;
+
+    // Score high-signal breaking impact + recency
+    const scoredItems = pool.map((it) => {
+      const isMajorWire = /(cnbc|reuters|bloomberg|wsj|wall street journal|barron|financial times)/i.test(it.source);
+      const isHighSignalEvent = /(raises? outlook|hikes? guidance|beats|rate hike|fed|resignation|approves?|investment|earnings)/i.test(it.title);
+      const boostMs = (isMajorWire ? 2 * 3600 * 1000 : 0) + (isHighSignalEvent ? 1.5 * 3600 * 1000 : 0);
+      return { it, scoreMs: it.timestampMs + boostMs };
     });
     scoredItems.sort((a, b) => b.scoreMs - a.scoreMs);
+
     const tickerCapMap = new Map<string, number>();
     const freshestItems: typeof rawItems = [];
     for (const s of scoredItems) {
-      const t = inferTickerFromHeadline(s.it.title, 'SPY');
+      const t = s.it.ticker;
+      const cap = t === 'SPY' ? 3 : 2;
       const count = tickerCapMap.get(t) || 0;
-      if (count >= 3) continue;
+      if (count >= cap) continue;
       tickerCapMap.set(t, count + 1);
       freshestItems.push(s.it);
       if (freshestItems.length >= 16) break;
     }
 
-    // Deterministic Hebrew contextual headline builder for high-impact shock events
-    const formatBreakingHeadlineHe = (rawTitle: string, sourceName: string, ticker: string): string => {
-      const lower = rawTitle.toLowerCase();
-      if (/jensen|huang/.test(lower) && /resign|depart|ouster|without|step.*down|scandal/.test(lower)) {
-        return `🚨 דרמה בענקית השבבים (${sourceName}): התפטרות מנכ"ל אנבידיה ג'נסן הואנג מטלטלת את השוק — ${rawTitle}`;
-      }
-      if (/broadcom|avgo/.test(lower) && /sink|downgrade|slash/.test(lower)) {
-        return `🔴 הורדת דירוג חדה ב-AVGO (${sourceName}): ${rawTitle}`;
-      }
-      if (/nebius|smci|super micro|dell/.test(lower) && /sink|slide|fall|probe/.test(lower)) {
-        return `🔴 לחץ מכירות בסקטור שרתי ה-AI (${sourceName}): ${rawTitle}`;
-      }
-      if (/inflation|fed|nasdaq|wall street|stock market/.test(lower)) {
-        return `🔴 מבזק וול סטריט (${sourceName}): ${rawTitle}`;
-      }
-      return `🔴 מבזק שוק חי • ${ticker} (${sourceName}): ${rawTitle}`;
-    };
-
-    // Build structured daily news cards with explicit reaction analysis
+    // Build structured daily news cards with clean Hebrew localization + reaction analysis
     const liveRssCards: any[] = freshestItems.map((raw, idx) => {
-      const ticker = inferTickerFromHeadline(raw.title, 'SPY');
+      const ticker = raw.ticker;
       const sourceInfo = normalizeSource(raw.title, raw.source);
       const { sentiment, movementType, catalystType, catalystSeverity } = analyzeArticleSentimentAndCatalyst(raw.title, raw.snippet);
 
       const isBear = sentiment === 'BEARISH';
       const isBull = sentiment === 'BULLISH';
       const knownInfo = GLOBAL_STOCK_KNOWLEDGE[ticker];
-      const companyName = knownInfo?.name || (ticker === 'SPY' ? 'S&P 500 / כללי' : `${ticker} Corp.`);
+      const companyName = knownInfo?.name || KNOWN_COMPANY_NAME_MAP[ticker] || (ticker === 'SPY' ? 'מדד S&P 500 ומאקרו' : `${ticker} Corp.`);
 
       const fallbackPrice = KNOWN_CATALOG_PRICES[ticker] || 150.0;
       const targetPrice = Number((fallbackPrice * (isBear ? 1.06 : 1.18)).toFixed(2));
       const buyZoneMax = Number((fallbackPrice * (isBear ? 0.94 : 1.02)).toFixed(2));
-      const heHeadline = formatBreakingHeadlineHe(raw.title, sourceInfo.name, ticker);
+
       const cacheKey = `${todayKey}:${ticker}:${raw.title.slice(0, 80)}`;
       const cachedAi = dailyAiNewsCache.get(cacheKey);
+      const deterministicHe = formatDeterministicHebrewNews({
+        rawTitle: raw.title,
+        snippet: raw.snippet,
+        ticker,
+        companyName,
+        sourceName: sourceInfo.name,
+        dateLabel: raw.dateLabel,
+        timeLabel: raw.timeLabel,
+        sentiment,
+      });
 
       const reactionAnalysis = buildContextualReactionAnalysis({
         ticker,
@@ -1265,18 +1550,16 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
       return {
         id: `rss-live-${ticker.toLowerCase()}-${idx}-${raw.timestampMs}`,
         isLiveRss: true,
+        hasFreshNews: true,
         newsDateKey: todayKey,
+        publishedAtMs: raw.timestampMs,
         rawTitleEn: raw.title,
         _aiCacheKey: cacheKey,
         ticker,
         companyName,
-        headline: cachedAi?.headlineHe || heHeadline,
-        _baseHeadline: cachedAi?.headlineHe || heHeadline,
-        summary: cachedAi?.summaryHe || (
-          raw.snippet && raw.snippet !== raw.title
-            ? `${raw.snippet}`
-            : `דיווח יומי מ-${sourceInfo.name} (${raw.dateLabel} • ${raw.timeLabel}): ${raw.title}`
-        ),
+        headline: cachedAi?.headlineHe || deterministicHe.headlineHe,
+        _baseHeadline: cachedAi?.headlineHe || deterministicHe.headlineHe,
+        summary: cachedAi?.summaryHe || deterministicHe.summaryHe,
         source: sourceInfo.name,
         sourceUrl: raw.link || sourceInfo.url,
         publishedTime: `${raw.timeLabel} · ${raw.dateLabel}`,
@@ -1310,7 +1593,7 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
       };
     });
 
-    // Enrich any uncached top breaking stories today with Gemini 4 Hydrogen (clear Hebrew + Reaction Analysis)
+    // Enrich uncached top breaking stories with Gemini 4 Hydrogen when API key is configured
     const ai = getAI();
     const uncachedForAi = liveRssCards
       .map((card, idx) => ({ card, idx }))
@@ -1394,20 +1677,7 @@ ${JSON.stringify(itemsForAi)}`;
       }
     }
 
-    // Prioritize today's live RSS stories; only fall back to curated items if fewer than 6 live RSS stories arrived
-    const combined =
-      liveRssCards.length >= 6
-        ? liveRssCards
-        : [
-            ...liveRssCards,
-            ...INITIAL_PREMARKET_NEWS_FEED.slice(0, Math.max(0, 8 - liveRssCards.length)).map((item) => ({
-              ...item,
-              _baseHeadline: item.headline,
-              newsDateKey: todayKey,
-            })),
-          ];
-
-    cachedPremarketNews = await enrichPremarketNewsWithLiveQuotes(combined);
+    cachedPremarketNews = await enrichPremarketNewsWithLiveQuotes(liveRssCards);
     lastRssNewsSyncTime = Date.now();
     lastRssSyncDateKey = todayKey;
     lastPremarketNewsGenerated = Date.now();
@@ -1441,92 +1711,29 @@ async function enrichPremarketNewsWithLiveQuotes(newsItems: any[]): Promise<any[
     }
   }
 
-  const nyDate = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  const currentTimeStr = nyDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true }) + ' EST';
-
   return newsItems.map((item) => {
     const t = (item.ticker || '').toUpperCase().trim();
     const live = quotesMap[t];
     if (live && live.source === 'yahoo_finance_live') {
-      let resolvedMovementType = item.movementType;
-      let resolvedSentiment = item.sentiment;
-      let resolvedCategory = item.messageCategory;
-      let resolvedRecommendation = item.recommendation ? { ...item.recommendation } : undefined;
-      // Preserve base headline without destructive permanent overwrite!
-      let resolvedHeadline = item._baseHeadline || item.headline;
-
-      // Real-Time Reconciliation for static/curated items only (never overwrite live breaking RSS headlines!)
-      if (!item.isLiveRss) {
-        if (live.changePercent >= 0.8 && (item.movementType === 'SHARP_DROP_WARNING' || /אזהרת ירידה|צונחת|נפלה|קריסה/i.test(resolvedHeadline))) {
-          resolvedMovementType = 'FORECAST_REVISION';
-          resolvedSentiment = 'BULLISH';
-          resolvedCategory = 'FORECAST_REVISION';
-          resolvedHeadline = `🔵 עדכון שוק חי ב-${t} (+${live.changePercent.toFixed(1)}%): עליות שערים והתאוששות מוסדית סביב $${live.price.toFixed(2)}`;
-          if (resolvedRecommendation) {
-            resolvedRecommendation.action = 'STRONG_BUY';
-            resolvedRecommendation.actionLabelHe = `עדכון מגמה חיובי - עלייה של +${live.changePercent.toFixed(1)}%`;
-            resolvedRecommendation.openingBellGamePlanHe = 'הצטרפות לתנופה או איסוף פוזיציה בפריצה.';
-          }
-        } else if (live.changePercent <= -3.0 && (item.movementType === 'IMPENDING_JUMP' || /קפיצה|זינוק/.test(resolvedHeadline))) {
-          resolvedMovementType = 'SHARP_DROP_WARNING';
-          resolvedSentiment = 'BEARISH';
-          resolvedCategory = 'DROP_WARNING';
-          resolvedHeadline = `⚠️ אזהרת לחץ מכירות ב-${t} (${live.changePercent.toFixed(1)}%): ירידה אל $${live.price.toFixed(2)}`;
-          if (resolvedRecommendation) {
-            resolvedRecommendation.action = 'CAUTION_ALERT';
-            resolvedRecommendation.actionLabelHe = `זהירות - לחץ מכירות של ${live.changePercent.toFixed(1)}%`;
-            resolvedRecommendation.openingBellGamePlanHe = 'הימנעות מקנייה נמהרת בפתיחה והמתנה לייצוב טכני.';
-          }
-        }
-      }
-
-      // Scale targetPrice cleanly if live price moved past static baseline
-      if (resolvedRecommendation && typeof resolvedRecommendation.targetPrice === 'number') {
-        if (live.price > resolvedRecommendation.targetPrice * 1.05 && resolvedSentiment === 'BULLISH') {
-          resolvedRecommendation.targetPrice = Number((live.price * 1.15).toFixed(2));
-          resolvedRecommendation.buyZoneMax = Number((live.price * 1.02).toFixed(2));
-        }
-      }
-
-      const reactionAnalysis =
-        item.reactionAnalysis ||
-        buildContextualReactionAnalysis({
-          ticker: t,
-          title: item.rawTitleEn || resolvedHeadline,
-          source: item.source || 'Wall Street Wire',
-          sentiment: resolvedSentiment,
-          catalystType: item.catalystType,
-          liveChangePercent: live.changePercent,
-          knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[t]?.moatHe,
-        });
-
-      return {
-        ...item,
-        _baseHeadline: item._baseHeadline || item.headline,
-        movementType: resolvedMovementType,
-        sentiment: resolvedSentiment,
-        messageCategory: resolvedCategory,
-        headline: resolvedHeadline,
-        reactionAnalysis,
-        recommendation: resolvedRecommendation || item.recommendation,
-        preMarketPrice: live.price,
-        preMarketChangePercent: live.changePercent,
-        publishedTime: item.publishedTime || currentTimeStr,
-        date: item.isLiveRss ? item.date : 'היום • עדכון שוק חי',
-      };
-    }
-    const reactionAnalysis =
-      item.reactionAnalysis ||
-      buildContextualReactionAnalysis({
+      const reactionAnalysis = buildContextualReactionAnalysis({
         ticker: t,
         title: item.rawTitleEn || item.headline,
         source: item.source || 'Wall Street Wire',
         sentiment: item.sentiment,
         catalystType: item.catalystType,
-        liveChangePercent: item.preMarketChangePercent,
+        liveChangePercent: live.changePercent,
         knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[t]?.moatHe,
+        aiOverride: item._aiCacheKey ? dailyAiNewsCache.get(item._aiCacheKey) : undefined,
       });
-    return { ...item, reactionAnalysis };
+
+      return {
+        ...item,
+        reactionAnalysis,
+        preMarketPrice: live.price,
+        preMarketChangePercent: live.changePercent,
+      };
+    }
+    return item;
   });
 }
 
@@ -1534,9 +1741,9 @@ async function enrichPremarketNewsWithLiveQuotes(newsItems: any[]): Promise<any[
 app.get(['/api/premarket-news', '/api/daily-news'], async (req, res) => {
   try {
     const todayKey = getTodayDateKey();
-    // Refresh automatically when a new day starts or every 2 minutes
-    if (lastRssSyncDateKey !== todayKey || Date.now() - lastRssNewsSyncTime > 120000) {
-      await refreshLiveRssBreakingNews(false);
+    // Refresh immediately on first boot or whenever a new day starts or > 2 minutes elapsed
+    if (cachedPremarketNews.length === 0 || lastRssSyncDateKey !== todayKey || Date.now() - lastRssNewsSyncTime > 120000) {
+      await refreshLiveRssBreakingNews(cachedPremarketNews.length === 0);
     } else if (Date.now() - lastQuotesEnrichedTime > 20000) {
       cachedPremarketNews = await enrichPremarketNewsWithLiveQuotes(cachedPremarketNews);
       lastQuotesEnrichedTime = Date.now();
@@ -1546,8 +1753,9 @@ app.get(['/api/premarket-news', '/api/daily-news'], async (req, res) => {
       pulse,
       news: cachedPremarketNews,
       todayDateKey: todayKey,
-      lastUpdated: new Date(lastPremarketNewsGenerated).toISOString(),
+      lastUpdated: new Date(lastPremarketNewsGenerated || Date.now()).toISOString(),
       rssSyncedAt: lastRssNewsSyncTime ? new Date(lastRssNewsSyncTime).toISOString() : undefined,
+      liveRssCount: cachedPremarketNews.filter((n) => n.isLiveRss).length,
       source: 'live_daily_news_and_reaction_analysis',
     });
   } catch (err: any) {
@@ -1898,435 +2106,6 @@ Provide an institutional deep teardown. Return strictly a JSON object with:
   }
 });
 
-// Built-in Institutional News & Risk Catalog for US Equities (S&P 500, Nasdaq, Medtech, Tech, Healthcare)
-const CURATED_TICKER_NEWS_CATALOG: Record<string, any> = {
-  'GOOGL': {
-    id: 'pm-googl-earnings-miss-capex-warning',
-    ticker: 'GOOGL',
-    companyName: 'Alphabet Inc. (Google)',
-    headline: '⚠️ אלפאבית / גוגל (GOOGL): תגובת שוק מעורבת לדוח – הוצאות CapEx מוגברות ל-AI מול צמיחה מואצת ב-Cloud',
-    summary: 'מניית אלפאבית התמודדה עם לחץ מכירות בעקבות דוח כספי שכלל העלאת תחזית הוצאות ה-CapEx לתשתיות מחשוב ו-AI שיגיעו למעל 55 מיליארד דולר, לצד צמיחה מואצת בענן (Google Cloud) ומנוע החיפוש. אנליסטים מותירים המלצות חיוביות עם יעד של $310.',
-    source: 'בלומברג וול סטריט & רויטרס (Bloomberg / Reuters Tech)',
-    sourceUrl: 'https://www.bloomberg.com',
-    publishedTime: '07:30 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'TECH_AI_CHIPS',
-    sentiment: 'BULLISH',
-    movementType: 'FORECAST_REVISION',
-    messageCategory: 'FORECAST_REVISION',
-    catalystType: 'EARNINGS_BEAT',
-    indexOrigin: 'BOTH',
-    estimatedImpactPct: '+3% עד +6%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 284.78,
-    preMarketChangePercent: 0.78,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'קנייה חזקה / צבירה - חפיר ענן ובינה מלאכותית מוביל',
-      actionLabelEn: 'Strong Buy - Leading AI & Cloud Infrastructure',
-      confidenceScore: 93,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'ההשקעות המאסיביות ב-CapEx (TPU + Gemini) מבטיחות את הובלת גוגל בתשתיות AI ומקנות חפיר ענן בלתי חדיר מול המתחרות.',
-      impactAnalysisEn: 'Aggressive AI capex cements hyperscaler dominance and custom silicon efficiency.',
-      openingBellGamePlanHe: 'איסוף מודרג לתיק איכות מוביל. יעד מחיר של $310 למניה.',
-      openingBellGamePlanEn: 'High conviction staged accumulation. Target price $310.',
-      targetPrice: 310.0,
-      buyZoneMax: 290.0,
-      riskFactorHe: 'המשך עלייה בהוצאות הוניות לפיתוח שבבים ומרכזי נתונים והליכי הגבלים עסקיים.',
-      riskFactorEn: 'Continued elevated CapEx intensity and DOJ antitrust remedies.',
-    },
-  },
-  'GOOG': {
-    id: 'pm-goog-earnings-miss-capex-warning',
-    ticker: 'GOOG',
-    companyName: 'Alphabet Inc. Class C (Google)',
-    headline: '⚠️ גוגל (GOOG): תגובת שוק מעורבת לדוח – הוצאות CapEx מוגברות ל-AI מול צמיחה מואצת ב-Cloud',
-    summary: 'מניית גוגל (GOOG) נסחרת ביציבות לאחר דוח מעורב: האצה בהוצאות CapEx לתשתיות מחשוב לצד רווחיות איתנה ורוח גבית מעסקי הענן. יעד האנליסטים עומד על $310.',
-    source: 'בלומברג וול סטריט (Bloomberg)',
-    sourceUrl: 'https://www.bloomberg.com',
-    publishedTime: '07:30 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'TECH_AI_CHIPS',
-    sentiment: 'BULLISH',
-    movementType: 'FORECAST_REVISION',
-    messageCategory: 'FORECAST_REVISION',
-    catalystType: 'EARNINGS_BEAT',
-    indexOrigin: 'BOTH',
-    estimatedImpactPct: '+3% עד +6%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 283.93,
-    preMarketChangePercent: 0.75,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'קנייה חזקה / צבירה - צמיחת ענן מואצת',
-      actionLabelEn: 'Strong Buy - Cloud Growth Acceleration',
-      confidenceScore: 93,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'החפיר העסקי לא נפגע: צמיחת הענן והחיפוש מוצקה, והמכפיל האטרקטיבי מהווה הזדמנות צבירה מוסדית.',
-      impactAnalysisEn: 'Core search and GCP moats remain unassailable.',
-      openingBellGamePlanHe: 'איסוף מודרג עם יעד של $310 למניה.',
-      openingBellGamePlanEn: 'Staged accumulation around technical support. Target $310.',
-      targetPrice: 310.0,
-      buyZoneMax: 290.0,
-      riskFactorHe: 'רגישות להוצאות פחת ו-CapEx מוגבר.',
-      riskFactorEn: 'CapEx margin overhang.',
-    },
-  },
-  'BE': {
-    id: 'pm-be-earnings-crush-guidance-raise',
-    ticker: 'BE',
-    companyName: 'Bloom Energy Corporation',
-    headline: '⚡ דוח כספי לוהט בבלום אנרג\'י (BE +3.4%): מעבר לרווחיות נקייה, זינוק של 27% בהכנסות והעלאת תחזית שנתית בעקבות חוזי ענק לאספקת חשמל לדאטה סנטרס של AI מול AEP ו-CoreWeave',
-    summary: 'בלום אנרג\'י (BE) דיווחה על תוצאות כספיות שהיכו את כל תחזיות וול סטריט (Double Beat): רווח למניה של $0.08 מול צפי להפסד של ($0.05-), והכנסות של 382 מיליון דולר (צמיחה של 27.3% YoY). החברה העלתה את תחזית ההכנסות השנתית ל-1.55-1.65 מיליארד דולר על רקע ביקושים חסרי תקדים לשרתי תאי דלק מוצקים (Solid Oxide) ממרכזי נתוני AI המתמודדים עם עומסי רשת החשמל.',
-    source: 'וול סטריט ג\'ורנל & בלומברג (WSJ / Bloomberg Energy Tech)',
-    sourceUrl: 'https://www.bloomberg.com',
-    publishedTime: '08:05 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'TECH_AI_CHIPS',
-    sentiment: 'BULLISH',
-    movementType: 'IMPENDING_JUMP',
-    catalystType: 'EARNINGS_BEAT',
-    indexOrigin: 'BOTH',
-    estimatedImpactPct: '+14% עד +22%',
-    catalystSeverity: 'CRITICAL',
-    preMarketPrice: 173.24,
-    preMarketChangePercent: 3.41,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'קנייה חזקה בפתיחה - פריצת דרך תפעולית בתשתיות AI',
-      actionLabelEn: 'Strong Buy on Open - AI Infrastructure Breakout',
-      confidenceScore: 95,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'מעבר מובהק לרווחיות נקייה מוכיח את המנוף התפעולי של טכנולוגיית תאי הדלק המוצקים. הביקוש המיידי לחשמל עצמאי בחוות שרתים עוקף את זמני ההמתנה של 4-7 שנים לחיבור לחברות חשמל.',
-      impactAnalysisEn: 'Inflection to GAAP operating profit confirms scalable operating leverage. Grid bypass deployment provides mission-critical power to hyperscaler AI clusters.',
-      openingBellGamePlanHe: 'איסוף מניות מדורג בפתיחה תוך ניצול המומנטום המוסדי. יעד מחיר של $195 למניה עם אופק צמיחה רב-שנתי.',
-      openingBellGamePlanEn: 'Scale into opening momentum backed by institutional revisions and contract backlog. Target price $195.',
-      targetPrice: 195.0,
-      buyZoneMax: 178.0,
-      riskFactorHe: 'מחזור אספקת רכיבים וקצב קבלת היתרי פריסה מקומיים.',
-      riskFactorEn: 'Supply chain cadence and local permitting lead times.',
-    },
-  },
-  'SOFI': {
-    id: 'pm-sofi-guidance-fintech-momentum',
-    ticker: 'SOFI',
-    companyName: 'SoFi Technologies, Inc.',
-    headline: '🚀 סופי (SOFI +1.2%): מומנטום חיובי בעקבות העלאת תחזיות שנתית, זינוק בפקדונות והתרחבות במקסיקו עם מאסטרקארד',
-    summary: 'סופי טכנולוגיות (SOFI) מציגה עוצמה עסקית ניכרת בטרום המסחר: הבנק הדיגיטלי העלה את תחזית הרווח השנתית בעקבות גידול חד בהפקדות חברים והרחבת מרווחי הריבית (NIM). במקביל, החברה מרחיבה את פלטפורמת התשתיות הפיננסיות של גלילאו (Tech Solutions) באמצעות שת"פ אסטרטגי עם מאסטרקארד (Mastercard) ו-Orbi להשקת כרטיסי תשלום מקושרים לקריפטו ו-Stablecoins במקסיקו, מה שפותח נתיב הכנסות B2B בינלאומי נוסף.',
-    source: 'וול סטריט ג\'ורנל & יאהו פייננס (WSJ / Yahoo Finance)',
-    sourceUrl: 'https://finance.yahoo.com',
-    publishedTime: '08:15 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'TECH_AI_CHIPS',
-    sentiment: 'BULLISH',
-    movementType: 'IMPENDING_JUMP',
-    messageCategory: 'SHARP_RISE',
-    catalystType: 'PARTNERSHIP_CONTRACT',
-    indexOrigin: 'NASDAQ_100',
-    estimatedImpactPct: '+3% עד +7%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 15.80,
-    preMarketChangePercent: 1.25,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'קנייה / צבירה - צמיחה מואצת בחטיבת הבנקאות והטכנולוגיה',
-      actionLabelEn: 'Accumulate - Bank Charter & Tech Expansion',
-      confidenceScore: 91,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'חיזוק משמעותי של לולאת הפרודוקטיביות הפיננסית: צמיחת פקדונות זולים מוזילה את עלויות המימון, בעוד שחטיבת הטכנולוגיה (Galileo) מייצרת הכנסות עמלות יציבות שאינן תלויות במחזורי אשראי צרכני.',
-      impactAnalysisEn: 'Financial services flywheel gaining traction. Member deposits reduce cost of capital while Galileo/Tech division expands fee-based B2B footprint.',
-      openingBellGamePlanHe: 'איסוף מודרג עם פקודות לימיט באזורי תמיכה. החברה עברה לרווחיות GAAP עקבית והתרחבות המוצרים מעניקה אופציונליות צמיחה גבוהה.',
-      openingBellGamePlanEn: 'Accumulate on pullbacks. Consistent GAAP profitability and international tech expansion support higher forward valuation multiple.',
-      targetPrice: 19.50,
-      buyZoneMax: 16.20,
-      riskFactorHe: 'רגישות לשינויים בתוואי הריבית של הפד ואיכות האשראי בתיק ההלוואות האישיות.',
-      riskFactorEn: 'Sensitivity to Fed rate path and unsecured personal loan credit performance.',
-    },
-  },
-  'NVMI': {
-    id: 'pm-nvmi-forecast-revision-guidance-raise',
-    ticker: 'NVMI',
-    companyName: 'Nova Ltd. (נובה מכשירי מדידה)',
-    headline: '🔵 שינוי והעלאת תחזיות חיובית בנובה (NVMI +11.7%): זינוק בביקוש למערכות מטרולוגיה ל-2nm ו-GAA, ואנליסטים מעלים מחירי יעד ל-$345',
-    summary: 'נובה (NVMI) מציגה התאוששות חדה ועלייה של כ-12% בטרום המסחר לאחר עדכון תחזיות רווח והכנסות כלפי מעלה: אימוץ מואץ של פלטפורמות המטרולוגיה המתקדמות (PRISM, ELIPSON ו-VERAFLEX) במפעלי שבבים מובילים (Foundry/Logic 2nm ו-HBM3e/HBM4). אנליסטים בבנקי ההשקעות נידהאם (Needham) ובנצ\'מרק (Benchmark) העלו מחירי יעד ל-$345.',
-    source: 'בלומברג וול סטריט & נידהאם (Bloomberg / Needham Semi Research)',
-    sourceUrl: 'https://www.bloomberg.com',
-    publishedTime: '08:20 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'ANALYST_RATINGS',
-    sentiment: 'BULLISH',
-    movementType: 'FORECAST_REVISION',
-    catalystType: 'ANALYST_UPGRADE',
-    indexOrigin: 'NASDAQ_100',
-    estimatedImpactPct: '+6% עד +12%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 313.18,
-    preMarketChangePercent: 11.73,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'שינוי תחזיות - העלאת מחירי יעד ל-$345 וביקוש ל-2nm',
-      actionLabelEn: 'Forecast Revision - Upgraded to $345 on 2nm Demand',
-      confidenceScore: 94,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'נובה מחזיקה בחפיר טכנולוגי בלתי חדיר בתחום המטרולוגיה החומרית והאופטית לשבבי Gate-All-Around (GAA). העלאת התחזיות מוכיחה שההאטה הזמנית בסקטור השבבים הכללי לא פגעה בביקושי הליבה לטכנולוגיות ייצור הקצה.',
-      impactAnalysisEn: 'Nova retains unmatched proprietary IP in materials and optical metrology for GAA/2nm architectures. Guidance upgrade confirms high structural pricing power and market share gains.',
-      openingBellGamePlanHe: 'הצטרפות לתנופה בפתיחת המסחר או איסוף פוזיציה בפריצה. יעד מחיר של $345 למניה.',
-      openingBellGamePlanEn: 'High conviction accumulation on breakout strength. Target price $345.',
-      targetPrice: 345.0,
-      buyZoneMax: 320.0,
-      riskFactorHe: 'מחזוריות השקעות עולמית במפעלי סיליקון והגבלות סחר בינלאומיות.',
-      riskFactorEn: 'Global semiconductor capex cycles and geopolitical trade restrictions.',
-    },
-  },
-  'BSX': {
-    id: 'pm-bsx-farapulse-jump',
-    ticker: 'BSX',
-    companyName: 'Boston Scientific Corporation',
-    headline: '⭐ בוסטון סיינטיפיק (BSX): האצת אימוץ מערכת Farapulse PFA להפרעות קצב לב ומחיר יעד של $49',
-    summary: 'בוסטון סיינטיפיק מציגה עוצמה עסקית ניכרת עם צמיחה שנתית של מעל 24% במגזר הקרדיווסקולרי, תוך התגברות מלאה על שיבושי העבר וחידוש אספקה סדיר לבתי חולים בעולם. זקס ומורגן סטנלי מעלים מחירי יעד ל-$49.',
-    source: 'זקס ומורגן סטנלי (Zacks & Morgan Stanley)',
-    sourceUrl: 'https://www.zacks.com/stock/quote/BSX',
-    publishedTime: '08:15 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'HEALTHCARE_BIO',
-    sentiment: 'BULLISH',
-    movementType: 'FORECAST_REVISION',
-    catalystType: 'ANALYST_UPGRADE',
-    indexOrigin: 'SP_500',
-    estimatedImpactPct: '+3% עד +6%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 42.75,
-    preMarketChangePercent: 2.05,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'שינוי תחזיות - הובלה עולמית בתחום ה-PFA',
-      actionLabelEn: 'Forecast Revision - Farapulse Moat Acceleration',
-      confidenceScore: 94,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'החפיר הרפואי של בוסטון סיינטיפיק בתחום ה-PFA (אלקטרופיזיולוגיה וצנתורים) נחשב לבלתי חדיר הודות לעלויות מעבר גבוהות והכשרת רופאים בלעדית.',
-      impactAnalysisEn: 'Farapulse PFA platform continues to drive durable market share gains in electrophysiology.',
-      openingBellGamePlanHe: 'איסוף פוזיציה לקראת פתיחת המסחר עם יעד מחיר של $49 ומרווח ביטחון תפעולי.',
-      openingBellGamePlanEn: 'Scale into opening strength with trailing limits. Target price $49.',
-      targetPrice: 49.0,
-      buyZoneMax: 44.0,
-      riskFactorHe: 'תחרות מתגברת מצד מכשירי אבלציה חדשים של מדטרוניק וג\'ונסון אנד ג\'ונסון.',
-      riskFactorEn: 'Competitive product rollouts from Medtronic and J&J in pulsed-field ablation.',
-    },
-  },
-  'UNH': {
-    id: 'pm-unh-alert',
-    ticker: 'UNH',
-    companyName: 'UnitedHealth Group Incorporated',
-    headline: '📊 דוח תמחור מחודש: יונייטד-הלת\' מאיצה העלאת פרמיות בביטוחים מסחריים לפיצוי על עליית שיעור התביעות הרפואיות (MLR)',
-    summary: 'יונייטד-הלת\' השלימה סבב חידושי חוזים מסחריים עם העלאות תעריפים של 6-8%, שנועדו לקזז את העלייה בניתוחים אלקטיביים והליכים אורתופדיים אצל מבוטחים ותיקים. במקביל, חטיבת Optum ממשיכה להרחיב את פריסת המרפאות ומערכות ה-AI להפחתת עלויות.',
-    source: 'Wall Street Journal / Healthcare Digest',
-    sourceUrl: 'https://www.wsj.com',
-    publishedTime: '07:50 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'HEALTHCARE_BIO',
-    sentiment: 'BULLISH',
-    movementType: 'IMPENDING_JUMP',
-    catalystType: 'EARNINGS_CATALYST',
-    indexOrigin: 'SP_500',
-    estimatedImpactPct: '+4% עד +8%',
-    catalystSeverity: 'MODERATE',
-    preMarketPrice: 394.15,
-    preMarketChangePercent: 1.15,
-    recommendation: {
-      action: 'ACCUMULATE_ON_DIP',
-      actionLabelHe: 'צבירה בירידות - מרווח ביטחון אטרקטיבי',
-      actionLabelEn: 'Accumulate on Dip - Strong Moat',
-      confidenceScore: 91,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'כוח תמחור מובהק והובלה עולמית המאפשרים לגלגל את אינפלציית הטיפולים ללקוחות. מכפיל רווח עתידי נוח ותשואת תזרים חופשי מעל 6% מספקים נקודת כניסה נדירה למשקיעים ארוכי טווח.',
-      impactAnalysisEn: 'Evident pricing power offsetting medical care inflation. High ROIC (18%) and vertical Optum moat remain intact.',
-      openingBellGamePlanHe: 'איסוף מנות מודרג סביב $390-$400 לקראת התאוששות שנתית ל-$440-$450.',
-      openingBellGamePlanEn: 'Staged accumulation around current price towards fair value target of $440+.',
-      targetPrice: 440.0,
-      buyZoneMax: 405.0,
-      riskFactorHe: 'לחץ רגולטורי נוסף על תעריפי Medicare Advantage מצד הממשל.',
-      riskFactorEn: 'Further CMS regulatory rate scrutiny on Medicare Advantage.',
-    },
-  },
-  'CVS': {
-    id: 'pm-cvs-wsj-2027-warning',
-    ticker: 'CVS',
-    companyName: 'CVS Health Corporation',
-    headline: '🔵 התאוששות במניית CVS Health (CVS +3.1%): ייצוב מרווחי Caremark ושיפור תזרימי בפעילות בתי המרקחת והביטוח לקראת 2026-2027',
-    summary: 'מניית CVS Health מציגה התאוששות חיובית עם עלייה של מעל 3% לאחר שדרוג תחזיות תזרים: הנהלת החברה הציגה צעדי התייעלות תפעולית בחטיבת Caremark וחידוש חוזי ביטוח מסחריים גדולים. אנליסטים מציינים כי מכפיל הרווח ההיסטורי הנמוך מספק שולי ביטחון רחבים ותשואת דיבידנד יציבה של מעל 3%.',
-    source: 'וול סטריט ג\'ורנל & רויטרס (WSJ / Reuters Health)',
-    sourceUrl: 'https://www.wsj.com',
-    publishedTime: '08:10 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'HEALTHCARE_BIO',
-    sentiment: 'BULLISH',
-    movementType: 'FORECAST_REVISION',
-    messageCategory: 'FORECAST_REVISION',
-    catalystType: 'EARNINGS_BEAT',
-    indexOrigin: 'SP_500',
-    estimatedImpactPct: '+2% עד +5%',
-    catalystSeverity: 'MODERATE',
-    preMarketPrice: 83.85,
-    preMarketChangePercent: 3.10,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'שינוי תחזיות - התאוששות תפעולית ומכפיל אטרקטיבי',
-      actionLabelEn: 'Forecast Revision - Operational Inflection & Value',
-      confidenceScore: 91,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'ייצוב מרווחי חטיבת Caremark ופעילות Aetna יוצרים נקודת מפנה תזרימית. במכפיל רווח נוח ותשואת דיבידנד של כ-3.1%, החברה מספקת תמחור אטרקטיבי.',
-      impactAnalysisEn: 'Caremark margin stabilization and commercial contract renewals support multi-year cash flow inflection.',
-      openingBellGamePlanHe: 'איסוף מניות מדורג בפתיחה לתיק ערך איכותי. יעד מחיר של $96 למניה.',
-      openingBellGamePlanEn: 'Systematic value accumulation on open. Target price $96.',
-      targetPrice: 96.0,
-      buyZoneMax: 86.0,
-      riskFactorHe: 'המשך ביקורת הרגולטור (FTC) על מחירי תרופות ודמי ניהול.',
-      riskFactorEn: 'FTC regulatory scrutiny on pharmacy benefit managers.',
-    },
-  },
-  'TSLA': {
-    id: 'pm-tsla-alert',
-    ticker: 'TSLA',
-    companyName: 'Tesla, Inc.',
-    headline: '⚡ טסלה (TSLA): דוח כספי חזק, התאוששות שולי הרווח לרכב ל-17.1% וזינוק של 112% בהכנסות אגירת אנרגיה (Megapack)',
-    summary: 'טסלה (TSLA) דיווחה על תוצאות כספיות שהפתיעו לטובה את וול סטריט: רווח למניה של $0.72 מול תחזית של $0.62 והכנסות שיא של 26.15 מיליארד דולר. הנהלת החברה אישרה כי עלות הייצור לרכב ירדה לשפל היסטורי של $34,800, בעוד שחטיבת האנרגיה הפכה למנוע רווח תפעולי מהותי המהווה מעל 22% מרווחי החברה. מחיר היעד הועלה ל-$395.',
-    source: 'Bloomberg Energy & Tech',
-    sourceUrl: 'https://www.bloomberg.com',
-    publishedTime: '07:30 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'TECH_AI_CHIPS',
-    sentiment: 'BULLISH',
-    movementType: 'IMPENDING_JUMP',
-    catalystType: 'EARNINGS_BEAT',
-    indexOrigin: 'BOTH',
-    estimatedImpactPct: '+5% עד +9%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 358.22,
-    preMarketChangePercent: 3.10,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'קנייה חזקה בפתיחה - נקודת פיתול במרווחי רכב ואנרגיה',
-      actionLabelEn: 'Strong Buy on Open - Auto & Megapack Inflection',
-      confidenceScore: 91,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'הדוח מסיר את החשש המרכזי שליווה את המניה ב-2025: שחיקת המרווחים הגיעה לשפל ומציגה התאוששות ברורה, בעוד שעסקי אגירת האנרגיה (Megapack) מייצרים תזרים מזומנים חופשי גבוה ויציב.',
-      impactAnalysisEn: 'Gross margin trough confirmed with Megapack business scaling into high-margin profit pillar. 5-year compounding thesis strengthened.',
-      openingBellGamePlanHe: 'איסוף מניות מדורג בפתיחת המסחר תוך ניצול המומנטום המוסדי החיובי. יעד מחיר של $395 למניה.',
-      openingBellGamePlanEn: 'Scale into opening strength backed by institutional EPS revisions and energy margins. Target price $395.',
-      targetPrice: 395.0,
-      buyZoneMax: 365.0,
-      riskFactorHe: 'תחרות מחירים בשוק הרכב הסיני והתקדמות רגולטורית ברישוי FSD ללא נהג.',
-      riskFactorEn: 'Chinese EV market competition and autonomous regulatory hurdles.',
-    },
-  },
-  'AMD': {
-    id: 'pm-amd-alert',
-    ticker: 'AMD',
-    companyName: 'Advanced Micro Devices, Inc.',
-    headline: '💻 AMD (+11.0%): זינוק חד בעקבות הרחבת חוזי ענק עם ספקיות ענן מובילות לאספקת מאיצי Instinct MI325X AI',
-    summary: 'ספקיות שירותי ענן מרחיבות פריסה של מעבדי ה-AI של AMD כחלופה זמינה ובעלת יחס עלות-תועלת גבוה לשבבי אנבידיה, עם צפי להכנסות AI מעל 5 מיליארד דולר השנה. אנליסטים מעלים מחירי יעד ל-$485.',
-    source: 'Reuters Technology',
-    sourceUrl: 'https://www.reuters.com',
-    publishedTime: '07:15 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'TECH_AI_CHIPS',
-    sentiment: 'BULLISH',
-    movementType: 'IMPENDING_JUMP',
-    catalystType: 'EARNINGS_BEAT',
-    indexOrigin: 'NASDAQ_100',
-    estimatedImpactPct: '+8% עד +14%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 449.04,
-    preMarketChangePercent: 11.04,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'קנייה חזקה - תנופת שרתי בינה מלאכותית',
-      actionLabelEn: 'Strong Buy on Data Center AI',
-      confidenceScore: 90,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'ביסוס מעמד כשחקן מספר 2 המוביל בשוק מרכזי הנתונים עם נתח שוק הולך וגדל בשרתי AI וארכיטקטורת ROCm.',
-      impactAnalysisEn: 'Cementing position as premier alternative AI accelerator provider for hyperscalers.',
-      openingBellGamePlanHe: 'רכישה לקראת פתיחת המסחר ביעד עלייה של $485.',
-      openingBellGamePlanEn: 'Buy for upside momentum towards $485.',
-      targetPrice: 485.0,
-      buyZoneMax: 455.0,
-      riskFactorHe: 'דומיננטיות תוכנת ה-CUDA של אנבידיה המגבילה מעבר מפתחים.',
-      riskFactorEn: 'NVIDIA CUDA software stickiness.',
-    },
-  },
-  'LLY': {
-    id: 'pm-lly-alert',
-    ticker: 'LLY',
-    companyName: 'Eli Lilly and Company',
-    headline: '🔬 אלי לילי: אישור להרחבת כושר הייצור של תרופות ההרזיה Zepbound והתקדמות בניסוי גלולת ה-GLP-1',
-    summary: 'ה-FDA אישר מתקן ייצור ענק נוסף של אלי לילי באינדיאנה, המסיים רשמית את המחסור בבתי המרקחת ומאפשר גידול תלת-ספרתי באספקת המזרקים בארה"ב וברחבי העולם. יעד מחיר $1,450.',
-    source: 'Financial Times Bio',
-    sourceUrl: 'https://www.ft.com',
-    publishedTime: '07:45 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'HEALTHCARE_BIO',
-    sentiment: 'BULLISH',
-    movementType: 'IMPENDING_JUMP',
-    catalystType: 'REGULATORY_FDA',
-    indexOrigin: 'SP_500',
-    estimatedImpactPct: '+3% עד +6%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 1354.00,
-    preMarketChangePercent: 2.10,
-    recommendation: {
-      action: 'ACCUMULATE_ON_DIP',
-      actionLabelHe: 'צבירה באיכות עליונה - מונפול דואופול עולמי ל-$1,450',
-      actionLabelEn: 'Accumulate Top Tier Quality to $1,450',
-      confidenceScore: 93,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'פתרון צוואר הבקבוק בייצור פותח דלת לרווחים חסרי תקדים עם הגנת פטנטים עד לשנות ה-2030 המאוחרות.',
-      impactAnalysisEn: 'Manufacturing unlock accelerates EPS compound runway backed by long-dated patent exclusivity.',
-      openingBellGamePlanHe: 'איסוף ממושך לתיק ארוך טווח. יעד מחיר של $1,450.',
-      openingBellGamePlanEn: 'Long-term compounding accumulation. Target $1,450.',
-      targetPrice: 1450.0,
-      buyZoneMax: 1380.0,
-      riskFactorHe: 'מכפיל רווח גבוה הדורש עמידה עקבית ביעדי מכירות.',
-      riskFactorEn: 'High valuation multiple leaving minimal buffer for quarterly hiccups.',
-    },
-  },
-  'INTC': {
-    id: 'pm-intc-alert',
-    ticker: 'INTC',
-    companyName: 'Intel Corporation',
-    headline: '🔵 אינטל (INTC +7.7%): התקדמות בייצור שבבי 18A וחיזוק מענקי ה-CHIPS Act מקפיצים את המניה בטרום המסחר',
-    summary: 'מניית אינטל מזנקת לאחר דיווחים על שיתופי פעולה אסטרטגיים בתחום שרתי ה-AI והתקדמות במפת הדרכים הטכנולוגית לייצור עצמאי בארה"ב. אנליסטים מעלים מחירי יעד ל-$65 על רקע התאוששות תזרים המזומנים הצפויה.',
-    source: 'בלומברג וול סטריט (Bloomberg / Semi Research)',
-    sourceUrl: 'https://www.bloomberg.com',
-    publishedTime: '08:00 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
-    category: 'TECH_AI_CHIPS',
-    sentiment: 'BULLISH',
-    movementType: 'IMPENDING_JUMP',
-    messageCategory: 'SHARP_RISE',
-    catalystType: 'PARTNERSHIP_CONTRACT',
-    indexOrigin: 'BOTH',
-    estimatedImpactPct: '+5% עד +10%',
-    catalystSeverity: 'HIGH',
-    preMarketPrice: 56.28,
-    preMarketChangePercent: 7.71,
-    recommendation: {
-      action: 'STRONG_BUY',
-      actionLabelHe: 'קנייה חזקה בפתיחה - נקודת מפנה בייצור 18A',
-      actionLabelEn: 'Strong Buy on Open - 18A Inflection',
-      confidenceScore: 91,
-      impactOn5YearThesis: 'STRENGTHENS_MOAT',
-      impactAnalysisHe: 'התקדמות בתהליך 18A מספקת לראשונה רוח גבית לזרוע הפאונדרי ומחזקת את המעמד האסטרטגי של אינטל בארה"ב מול מתחרות גלובליות.',
-      impactAnalysisEn: 'Process node 18A execution confirms inflection in domestic foundry roadmap, supported by federal CHIPS Act capital.',
-      openingBellGamePlanHe: 'איסוף מניות בפתיחה תוך ניצול המומנטום המחודש. יעד מחיר של $65 למניה.',
-      openingBellGamePlanEn: 'Momentum accumulation on open backed by operational milestones. Target price $65.',
-      targetPrice: 65.0,
-      buyZoneMax: 58.0,
-      riskFactorHe: 'הוצאות הוניות מוגברות וקצב תפוקת מפעלים (Yields) ברבעונים הקרובים.',
-      riskFactorEn: 'Elevated CapEx commitments and node yield maturation cadence.',
-    },
-  },
-};
-
 // 4. Multi-Source Web News Intelligence Engine (WSJ, Bloomberg, Reuters, CNBC, Financial Times, Barron's, Yahoo Finance)
 interface WebArticleItem {
   id: string;
@@ -2350,11 +2129,15 @@ interface WebArticleItem {
 function cleanHtmlSnippet(html: string): string {
   if (!html) return '';
   let cleaned = html
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&#x27;/g, "'")
+    .replace(/&apos;|&#0?39;|&#x27;|&#8217;|&#8216;/gi, "'")
+    .replace(/&#8220;|&#8221;/g, '"')
+    .replace(/&#8211;|&#8212;|&ndash;|&mdash;/gi, '-')
+    .replace(/&#(\d+);/g, (_m, dec) => String.fromCharCode(Number(dec)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/&amp;/g, '&')
     .replace(/&nbsp;/g, ' ')
     .replace(/<[^>]+>/g, ' ')
@@ -2394,12 +2177,12 @@ function analyzeArticleSentimentAndCatalyst(
 
   // 2. Explicit Bearish / Leadership Shock Signals
   const hasLeadershipShock = /resign(s|ed|ation)?|step(s|ped)? down|departs?|ouster|ousted|scandal|fired|without jensen/i.test(combined);
-  const hasGuidanceCut = /guidance cut|cuts outlook|lowers forecast|slashes forecast|warns on profit|profit warning|revenue miss/i.test(cleanTitle)
+  const hasGuidanceCut = /guidance cut|cuts outlook|lowers forecast|slashes forecast|warns on profit|profit warning|revenue miss|outlook miss(es)?|misses estimates/i.test(cleanTitle)
     || /guidance cut|cuts (its )?outlook|lowers (its )?forecast|slashes (its )?target/i.test(cleanSnippet);
-  const hasLegalOrProbe = /sec (probe|investigation|charges)|fraud|lawsuit|subpoena|regulatory probe|indictment|criminal|smuggling probe/i.test(combined);
+  const hasLegalOrProbe = /sec (probe|investigation|charges)|(?<!anti-)\bfraud\b|anti-fraud rule|lawsuit|subpoena|regulatory probe|indictment|criminal|smuggling probe/i.test(combined);
   const hasCyberOrBreach = /cyberattack|ransomware|security breach|data breach|system outage/i.test(combined);
-  const hasDowngrade = /downgrade|downgrades|cuts rating|underweight|sell rating|slashes price target|slashes target/i.test(cleanTitle);
-  const hasSharpPlunge = /plunges?|crashes?|tumbles?|sinks?|slides?|slumps?|sell[- ]?off|drops \d+%|falls \d+%/i.test(cleanTitle);
+  const hasDowngrade = /downgrade|downgrades|cuts rating|underweight|sell rating|slashes price target|slashes target|warning for/i.test(cleanTitle);
+  const hasSharpPlunge = /plunges?|crashes?|tumbles?|sinks?|slides?|slumps?|sputters?|drag(s)? down|sell[- ]?off|drops \d+%|falls \d+%|stocks fall|dow sinks/i.test(cleanTitle);
 
   // Severe / critical drop
   if (hasLeadershipShock || hasGuidanceCut || hasLegalOrProbe || hasCyberOrBreach || hasDowngrade || hasSharpPlunge) {
@@ -2494,17 +2277,69 @@ function normalizeSource(rawTitle: string, rawSource: string): { name: string; u
   return { name: rawSource || 'Global Financial Wire', url: 'https://news.google.com', isMajor: false };
 }
 
-async function fetchMultiSourceWebNews(query: string, tickerHint?: string): Promise<WebArticleItem[]> {
-  const cleanQ = query.trim();
-  if (!cleanQ) return [];
+// Verify an article genuinely mentions the queried ticker or its company name (prevents Yahoo/Google RSS off-topic leaks!)
+function matchesTickerRelevance(title: string, snippet: string, ticker: string, companyName?: string): boolean {
+  const cleanTicker = ticker.toUpperCase().trim();
+  const t = (title || '').trim();
+  const s = (snippet || '').trim();
+  const combined = `${t} ${s}`;
 
-  const ticker = (tickerHint || '').toUpperCase().trim();
-  const searchQueries = [cleanQ];
-  if (ticker && !cleanQ.toUpperCase().includes(ticker)) {
-    searchQueries.push(`${ticker} stock news`);
+  const patternEntry = TICKER_COMPANY_PATTERNS.find((p) => p.ticker === cleanTicker);
+  if (patternEntry && patternEntry.titleRegex.test(t)) return true;
+
+  const baseCompany = (companyName || GLOBAL_STOCK_KNOWLEDGE[cleanTicker]?.name || KNOWN_COMPANY_NAME_MAP[cleanTicker] || '')
+    .replace(/,?\s*(Inc\.?|Corp\.?|Corporation|Ltd\.?|Limited|N\.V\.?|S\.A\.?|plc|Incorporated|Companies|Technologies|The\s+).*$/i, '')
+    .replace(/^The\s+/i, '')
+    .trim();
+
+  if (baseCompany.length >= 3) {
+    const escaped = baseCompany.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`\\b${escaped}`, 'i').test(t)) return true;
   }
 
-  const articlesMap = new Map<string, WebArticleItem>();
+  // Explicit ticker symbol markers in headline (e.g., (NASDAQ:ITRN), (NYSE:V), ($NVDA), or >= 3 char ticker token)
+  const explicitTickerTag = new RegExp(`(?:\\((?:NASDAQ|NYSE|AMEX)\\s*:|\\(\\$|\\$)\\s*${cleanTicker.replace('.', '[.-]')}\\b`, 'i');
+  if (explicitTickerTag.test(combined)) return true;
+
+  if (cleanTicker.length >= 3) {
+    const wordTickerRegex = new RegExp(`\\b${cleanTicker.replace('.', '[.-]')}\\b`, 'i');
+    if (wordTickerRegex.test(t)) return true;
+  }
+
+  return false;
+}
+
+async function fetchMultiSourceWebNews(query: string, tickerHint?: string, companyNameHint?: string): Promise<WebArticleItem[]> {
+  const cleanQ = query.trim();
+  if (!cleanQ && !tickerHint) return [];
+
+  const ticker = (tickerHint || '').toUpperCase().trim();
+  const patternEntry = ticker ? TICKER_COMPANY_PATTERNS.find((p) => p.ticker === ticker) : undefined;
+  const rawCompanyName =
+    companyNameHint ||
+    patternEntry?.name ||
+    GLOBAL_STOCK_KNOWLEDGE[ticker]?.name ||
+    '';
+  const shortCompanyName = rawCompanyName
+    .replace(/,?\s*(Inc\.?|Corp\.?|Corporation|Ltd\.?|Limited|N\.V\.?|S\.A\.?|plc|Incorporated|Companies).*$/i, '')
+    .replace(/^The\s+/i, '')
+    .trim();
+
+  // Build targeted, clean search queries (prevents single-letter tickers like V/C/A from matching crypto/random junk)
+  const searchQueries: string[] = [];
+  if (ticker) {
+    if (patternEntry?.queryHint) {
+      searchQueries.push(`(${patternEntry.queryHint}) when:14d`);
+    } else if (shortCompanyName && shortCompanyName.length >= 3) {
+      searchQueries.push(`("${shortCompanyName}" OR "NASDAQ:${ticker}" OR "NYSE:${ticker}") (stock OR shares OR earnings OR news) when:21d`);
+    } else {
+      searchQueries.push(`("${ticker}" stock OR "${ticker}" shares OR "${ticker}" earnings) when:14d`);
+    }
+  } else {
+    searchQueries.push(`${cleanQ} when:14d`);
+  }
+
+  const articlesMap = new Map<string, WebArticleItem & { _rankScore: number; _ageHours: number }>();
 
   const fetchRss = async (url: string) => {
     try {
@@ -2513,13 +2348,89 @@ async function fetchMultiSourceWebNews(query: string, tickerHint?: string): Prom
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
           'Accept': 'application/rss+xml, application/xml, text/xml, */*',
         },
-        signal: AbortSignal.timeout(3500),
+        signal: AbortSignal.timeout(4000),
       });
       if (!res.ok) return '';
       return await res.text();
-    } catch (e) {
+    } catch {
       return '';
     }
+  };
+
+  const pushParsedArticle = (opts: {
+    idPrefix: string;
+    rawTitle: string;
+    link: string;
+    rawSource: string;
+    snippet: string;
+    pubDate: string;
+  }) => {
+    const { idPrefix, rawTitle, link, rawSource, snippet, pubDate } = opts;
+    if (!rawTitle) return;
+    const normKey = rawTitle.toLowerCase().replace(/\s*[-–|]\s*[^-–|]+$/, '').trim();
+    if (articlesMap.has(normKey)) return;
+
+    // 1. Strict spam/SEO quote page rejection
+    if (isIrrelevantOrSpamHeadline(rawTitle, snippet, rawSource, false)) return;
+
+    // 2. Strict ticker/company relevance verification when ticker is specified
+    if (ticker && !matchesTickerRelevance(rawTitle, snippet, ticker, shortCompanyName)) return;
+
+    // 3. Strict recency window (max 21 days; drop ancient news)
+    const timing = formatRssPublishedTime(pubDate);
+    if (!timing || timing.ageHours > 21 * 24) return;
+
+    const sourceInfo = normalizeSource(rawTitle, rawSource);
+    const { sentiment, movementType, catalystType, catalystSeverity } = analyzeArticleSentimentAndCatalyst(rawTitle, snippet);
+    const isRoutineForm4 = /\binsider sells [\d,]+ shares\b|\binsider sold shares\b|\bunder a trading plan,.*sold [\d,]+ shares\b/i.test(`${rawTitle} ${snippet}`);
+    const companyDisplay = rawCompanyName || (ticker ? `${ticker} Corp.` : 'Global Equity');
+
+    const detHe = formatDeterministicHebrewNews({
+      rawTitle,
+      snippet,
+      ticker: ticker || 'SPY',
+      companyName: companyDisplay,
+      sourceName: sourceInfo.name,
+      dateLabel: timing.dateLabel,
+      timeLabel: timing.timeLabel,
+      sentiment,
+    });
+
+    const rankBoostHours =
+      (sourceInfo.isMajor ? 24 : 0) +
+      (timing.ageHours <= 48 ? 18 : 0) +
+      (isRoutineForm4 ? -96 : 0);
+
+    articlesMap.set(normKey, {
+      id: `${idPrefix}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      title: rawTitle,
+      headlineHe: detHe.headlineHe,
+      summaryHe: detHe.summaryHe,
+      source: sourceInfo.name,
+      sourceUrl: sourceInfo.url,
+      link,
+      pubDate,
+      snippet,
+      ticker: ticker || undefined,
+      sentiment,
+      movementType,
+      catalystType,
+      catalystSeverity,
+      isMajorSource: sourceInfo.isMajor,
+      _ageHours: timing.ageHours,
+      _rankScore: timing.timestampMs + rankBoostHours * 3600 * 1000,
+      recommendation: {
+        action: sentiment === 'BEARISH' ? 'CAUTION_ALERT' : sentiment === 'BULLISH' ? 'STRONG_BUY' : 'HOLD_MONITOR',
+        actionLabelHe: sentiment === 'BEARISH' ? '⚠️ זהירות - בחינת סיכון והמתנה' : sentiment === 'BULLISH' ? '🚀 מומנטום חיובי בפתיחה' : 'מעקב מסחר וניתוח',
+        actionLabelEn: sentiment === 'BEARISH' ? 'Downside Risk - Caution' : sentiment === 'BULLISH' ? 'Bullish Open Momentum' : 'Monitor & Hold',
+        openingBellGamePlanHe: sentiment === 'BEARISH'
+          ? 'להמתין להתייצבות המחיר ולא למהר לקנות ביום הידיעה.'
+          : sentiment === 'BULLISH'
+          ? 'איסוף מודרג באזורי תמיכה ללא מרדף.'
+          : 'מעקב מסודר אחר תגובת השוק ללא צעד חפוז.',
+        openingBellGamePlanEn: sentiment === 'BEARISH' ? 'Avoid aggressive dip buying. Enforce strict risk limits.' : sentiment === 'BULLISH' ? 'Accumulate on dips.' : 'Observe and monitor price discovery.',
+      },
+    });
   };
 
   const tasks: Promise<void>[] = [];
@@ -2533,83 +2444,27 @@ async function fetchMultiSourceWebNews(query: string, tickerHint?: string): Prom
         if (!xml) return;
 
         const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
-        for (const itemXml of itemMatches.slice(0, 15)) {
-          const titleMatch = itemXml.match(/<title>(.*?)<\/title>/);
-          const linkMatch = itemXml.match(/<link>(.*?)<\/link>/);
-          const pubDateMatch = itemXml.match(/<pubDate>(.*?)<\/pubDate>/);
-          const sourceMatch = itemXml.match(/<source[^>]*>(.*?)<\/source>/);
-          const descMatch = itemXml.match(/<description>(.*?)<\/description>/);
+        for (const itemXml of itemMatches.slice(0, 18)) {
+          const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/);
+          const linkMatch = itemXml.match(/<link>([\s\S]*?)<\/link>/);
+          const pubDateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/);
+          const sourceMatch = itemXml.match(/<source[^>]*>([\s\S]*?)<\/source>/);
+          const descMatch = itemXml.match(/<description>([\s\S]*?)<\/description>/);
 
-          const rawTitle = titleMatch ? cleanHtmlSnippet(titleMatch[1]) : '';
-          const link = linkMatch ? linkMatch[1] : '';
-          const rawSource = sourceMatch ? cleanHtmlSnippet(sourceMatch[1]) : '';
-          const snippet = descMatch ? cleanHtmlSnippet(descMatch[1]) : '';
-          const pubDate = pubDateMatch ? pubDateMatch[1] : '';
-
-          if (!rawTitle || articlesMap.has(rawTitle)) continue;
-
-          const sourceInfo = normalizeSource(rawTitle, rawSource);
-
-          // Categorize sentiment & movement accurately
-          const { sentiment, movementType, catalystType, catalystSeverity } = analyzeArticleSentimentAndCatalyst(rawTitle, snippet);
-
-          const articleId = `art-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-
-          let headlineHe = rawTitle;
-          let summaryHe = snippet || rawTitle;
-
-          if (rawTitle.includes('WSJ') || sourceInfo.name.includes('WSJ')) {
-            headlineHe = `וול סטריט ג'ורנל (WSJ): ${rawTitle.replace(/\s*-\s*WSJ$/i, '')}`;
-          } else if (sourceInfo.name.includes('Zacks') || sourceInfo.name.includes('זקס')) {
-            headlineHe = `זקס (Zacks Investment Research): ${rawTitle.replace(/\s*-\s*Zacks.*$/i, '')}`;
-          } else if (sourceInfo.name.includes('Morgan Stanley') || sourceInfo.name.includes('מורגן סטנלי')) {
-            headlineHe = `מורגן סטנלי (Morgan Stanley Research): ${rawTitle.replace(/\s*-\s*Morgan Stanley.*$/i, '')}`;
-          } else if (sourceInfo.name.includes('J.P. Morgan') || sourceInfo.name.includes('ג\'יי פי מורגן')) {
-            headlineHe = `ג'יי פי מורגן (J.P. Morgan Global Research): ${rawTitle.replace(/\s*-\s*J\.?P\.? Morgan.*$/i, '')}`;
-          } else if (sourceInfo.name.includes('Bloomberg')) {
-            headlineHe = `בלומברג (Bloomberg): ${rawTitle.replace(/\s*-\s*Bloomberg$/i, '')}`;
-          } else if (sourceInfo.name.includes('Reuters')) {
-            headlineHe = `רויטרס (Reuters): ${rawTitle.replace(/\s*-\s*Reuters$/i, '')}`;
-          } else if (sourceInfo.name.includes('CNBC')) {
-            headlineHe = `CNBC: ${rawTitle.replace(/\s*-\s*CNBC$/i, '')}`;
-          } else if (sourceInfo.name.includes('Yahoo') || sourceInfo.name.includes('יאהו')) {
-            headlineHe = `יאהו פייננס (Yahoo Finance): ${rawTitle.replace(/\s*-\s*Yahoo Finance.*$/i, '')}`;
-          }
-
-          articlesMap.set(rawTitle, {
-            id: articleId,
-            title: rawTitle,
-            headlineHe,
-            summaryHe,
-            source: sourceInfo.name,
-            sourceUrl: sourceInfo.url,
-            link,
-            pubDate,
-            snippet,
-            ticker: ticker || undefined,
-            sentiment,
-            movementType,
-            catalystType,
-            catalystSeverity,
-            isMajorSource: sourceInfo.isMajor,
-            recommendation: {
-              action: sentiment === 'BEARISH' ? 'CAUTION_ALERT' : sentiment === 'BULLISH' ? 'STRONG_BUY' : 'HOLD_MONITOR',
-              actionLabelHe: sentiment === 'BEARISH' ? '⚠️ זהירות - בחינת סיכון והמתנה' : sentiment === 'BULLISH' ? '🚀 מומנטום חיובי בפתיחה' : 'מעקב מסחר וניתוח',
-              actionLabelEn: sentiment === 'BEARISH' ? 'Downside Risk - Caution' : sentiment === 'BULLISH' ? 'Bullish Open Momentum' : 'Monitor & Hold',
-              openingBellGamePlanHe: sentiment === 'BEARISH'
-                ? 'להמתין מחוץ למניה או לממש חלק מהפוזיציה להגנה על ההון; אין למהר לקנות עד לספיגת עודפי ההיצע.'
-                : sentiment === 'BULLISH'
-                ? 'איסוף מודרג עם לימיט בפתיחה וניצול מומנטום מוסדי.'
-                : 'מעקב אחר פקודות המסחר ללא פעולה חפוזה בפתיחה.',
-              openingBellGamePlanEn: sentiment === 'BEARISH' ? 'Avoid aggressive dip buying. Enforce strict risk limits.' : sentiment === 'BULLISH' ? 'Accumulate on dips.' : 'Observe and monitor price discovery.',
-            },
+          pushParsedArticle({
+            idPrefix: 'art',
+            rawTitle: titleMatch ? cleanHtmlSnippet(titleMatch[1]) : '',
+            link: linkMatch ? cleanHtmlSnippet(linkMatch[1]) : '',
+            rawSource: sourceMatch ? cleanHtmlSnippet(sourceMatch[1]) : '',
+            snippet: descMatch ? cleanHtmlSnippet(descMatch[1]) : '',
+            pubDate: pubDateMatch ? cleanHtmlSnippet(pubDateMatch[1]) : '',
           });
         }
       })()
     );
   }
 
-  // 2. Yahoo Finance RSS
+  // 2. Yahoo Finance RSS (strictly verified via matchesTickerRelevance)
   if (ticker) {
     tasks.push(
       (async () => {
@@ -2618,53 +2473,19 @@ async function fetchMultiSourceWebNews(query: string, tickerHint?: string): Prom
         if (!xml) return;
 
         const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/g) || [];
-        for (const itemXml of itemMatches.slice(0, 10)) {
-          const titleMatch = itemXml.match(/<title>(.*?)<\/title>/);
-          const linkMatch = itemXml.match(/<link>(.*?)<\/link>/);
-          const pubDateMatch = itemXml.match(/<pubDate>(.*?)<\/pubDate>/);
-          const descMatch = itemXml.match(/<description>(.*?)<\/description>/);
+        for (const itemXml of itemMatches.slice(0, 12)) {
+          const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/);
+          const linkMatch = itemXml.match(/<link>([\s\S]*?)<\/link>/);
+          const pubDateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/);
+          const descMatch = itemXml.match(/<description>([\s\S]*?)<\/description>/);
 
-          const rawTitle = titleMatch ? cleanHtmlSnippet(titleMatch[1]) : '';
-          const link = linkMatch ? linkMatch[1] : '';
-          const snippet = descMatch ? cleanHtmlSnippet(descMatch[1]) : '';
-          const pubDate = pubDateMatch ? pubDateMatch[1] : '';
-
-          if (!rawTitle || articlesMap.has(rawTitle)) continue;
-
-          const sourceInfo = normalizeSource(rawTitle, 'Yahoo Finance');
-
-          // Categorize sentiment & movement accurately
-          const { sentiment, movementType, catalystType, catalystSeverity } = analyzeArticleSentimentAndCatalyst(rawTitle, snippet);
-
-          const articleId = `art-yf-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-
-          articlesMap.set(rawTitle, {
-            id: articleId,
-            title: rawTitle,
-            headlineHe: `${sourceInfo.name}: ${rawTitle}`,
-            summaryHe: snippet || rawTitle,
-            source: sourceInfo.name,
-            sourceUrl: sourceInfo.url,
-            link,
-            pubDate,
-            snippet,
-            ticker: ticker,
-            sentiment,
-            movementType,
-            catalystType,
-            catalystSeverity,
-            isMajorSource: sourceInfo.isMajor,
-            recommendation: {
-              action: sentiment === 'BEARISH' ? 'CAUTION_ALERT' : sentiment === 'BULLISH' ? 'STRONG_BUY' : 'HOLD_MONITOR',
-              actionLabelHe: sentiment === 'BEARISH' ? '⚠️ זהירות - בחינת סיכון והמתנה' : sentiment === 'BULLISH' ? '🚀 מומנטום חיובי בפתיחה' : 'מעקב מסחר וניתוח',
-              actionLabelEn: sentiment === 'BEARISH' ? 'Downside Risk - Caution' : sentiment === 'BULLISH' ? 'Bullish Open Momentum' : 'Monitor & Hold',
-              openingBellGamePlanHe: sentiment === 'BEARISH'
-                ? 'להמתין מחוץ למניה או לממש חלק מהפוזיציה להגנה על ההון; אין למהר לקנות עד לספיגת עודפי ההיצע.'
-                : sentiment === 'BULLISH'
-                ? 'איסוף מודרג עם לימיט בפתיחה וניצול מומנטום מוסדי.'
-                : 'מעקב אחר פקודות המסחר ללא פעולה חפוזה בפתיחה.',
-              openingBellGamePlanEn: sentiment === 'BEARISH' ? 'Avoid aggressive dip buying. Enforce strict risk limits.' : sentiment === 'BULLISH' ? 'Accumulate on dips.' : 'Observe and monitor price discovery.',
-            },
+          pushParsedArticle({
+            idPrefix: 'art-yf',
+            rawTitle: titleMatch ? cleanHtmlSnippet(titleMatch[1]) : '',
+            link: linkMatch ? cleanHtmlSnippet(linkMatch[1]) : '',
+            rawSource: 'Yahoo Finance',
+            snippet: descMatch ? cleanHtmlSnippet(descMatch[1]) : '',
+            pubDate: pubDateMatch ? cleanHtmlSnippet(pubDateMatch[1]) : '',
           });
         }
       })()
@@ -2673,20 +2494,12 @@ async function fetchMultiSourceWebNews(query: string, tickerHint?: string): Prom
 
   await Promise.allSettled(tasks);
 
-  const result = Array.from(articlesMap.values());
-  return result.sort((a, b) => {
-    const tA = a.pubDate ? Date.parse(a.pubDate) || 0 : 0;
-    const tB = b.pubDate ? Date.parse(b.pubDate) || 0 : 0;
-    if (tA !== tB) return tB - tA; // Newest breaking news first
-    if (a.isMajorSource && !b.isMajorSource) return -1;
-    if (!a.isMajorSource && b.isMajorSource) return 1;
-    if (a.catalystSeverity === 'CRITICAL' && b.catalystSeverity !== 'CRITICAL') return -1;
-    if (a.catalystSeverity !== 'CRITICAL' && b.catalystSeverity === 'CRITICAL') return 1;
-    return 0;
-  });
+  return Array.from(articlesMap.values())
+    .sort((a, b) => b._rankScore - a._rankScore)
+    .map(({ _rankScore, _ageHours, ...rest }) => rest);
 }
 
-// 5. Universal Stock News & Risk Scanner for ANY Ticker
+// 5. Universal Stock News & Risk Scanner for ANY Ticker (Strictly Live News — Zero Stale Curated Overrides)
 async function buildUniversalStockAlert(tickerStr: string, forceRefresh: boolean = false): Promise<any> {
   const cleanTicker = tickerStr.toUpperCase().trim();
   const aliased = SERVER_TICKER_ALIASES[cleanTicker] || cleanTicker;
@@ -2694,80 +2507,60 @@ async function buildUniversalStockAlert(tickerStr: string, forceRefresh: boolean
   // 1. Fetch real market quote to verify current live reality
   const liveQuote = await fetchRealMarketQuote(aliased);
 
-  // 2. Check curated catalog (if not force-refreshing and no price/sentiment contradiction)
-  if (!forceRefresh && CURATED_TICKER_NEWS_CATALOG[aliased]) {
-    const catalogItem = { ...CURATED_TICKER_NEWS_CATALOG[aliased] };
-    if (liveQuote?.price) {
-      catalogItem.preMarketPrice = liveQuote.price;
-      catalogItem.preMarketChangePercent = liveQuote.changePercent;
-    }
-    // If catalog predicted a sharp drop crash but live quote is clearly positive, don't serve outdated crash warning
-    const isContradictoryCrash =
-      catalogItem.movementType === 'SHARP_DROP_WARNING' && liveQuote.changePercent > 0.4;
-    if (!isContradictoryCrash) {
-      return catalogItem;
-    }
-  }
-
-  // 3. Check existing premarket feed (if not force-refreshing and no contradiction)
+  // 2. Check existing live daily RSS feed if recent (<= 48h) and not force-refreshing
   if (!forceRefresh) {
     const existingInFeed = cachedPremarketNews.find(
-      (n) => n.ticker.toUpperCase() === aliased
+      (n) => n.isLiveRss && n.ticker.toUpperCase() === aliased
     );
     if (existingInFeed) {
-      const feedItem = { ...existingInFeed };
+      const feedItem = { ...existingInFeed, hasFreshNews: true };
       if (liveQuote?.price) {
         feedItem.preMarketPrice = liveQuote.price;
         feedItem.preMarketChangePercent = liveQuote.changePercent;
       }
-      const isContradictoryCrash =
-        feedItem.movementType === 'SHARP_DROP_WARNING' && liveQuote.changePercent > 0.4;
-      if (!isContradictoryCrash) {
-        return feedItem;
-      }
+      return feedItem;
     }
   }
 
-  // 4. Fetch real live multi-source web news in parallel
-  const webArticles = await fetchMultiSourceWebNews(`${aliased} stock news`, aliased);
-
+  // 3. Fetch real live multi-source web news using both company name & ticker
+  const companyNameResolved = liveQuote.companyName || GLOBAL_STOCK_KNOWLEDGE[aliased]?.name || KNOWN_COMPANY_NAME_MAP[aliased] || aliased;
+  const webArticles = await fetchMultiSourceWebNews(`${aliased} stock news`, aliased, companyNameResolved);
   const topArticle = webArticles[0];
+  const topTiming = topArticle ? formatRssPublishedTime(topArticle.pubDate) : null;
 
   const ai = getAI();
-  if (isGeminiAvailable() && ai) {
+  if (isGeminiAvailable() && ai && topArticle) {
     try {
       const articlesContext = webArticles
         .slice(0, 5)
         .map((a) => `- [${a.source}] ${a.title} (${a.pubDate}): ${a.snippet}`)
         .join('\n');
 
-      const prompt = `You are a Chief Investment Strategist at a top Wall Street fund.
-Analyze the US equity ticker: "${aliased}" (${liveQuote.companyName || aliased}).
-Current market price: $${liveQuote.price.toFixed(2)}, Change today: ${liveQuote.changePercent > 0 ? '+' : ''}${liveQuote.changePercent.toFixed(2)}%.
+      const prompt = `You are a practical financial news analyst explaining breaking news in clear, simple Hebrew for investors.
+Analyze the US equity ticker: "${aliased}" (${companyNameResolved}).
+Current live market price: $${liveQuote.price.toFixed(2)}, Change today: ${liveQuote.changePercent > 0 ? '+' : ''}${liveQuote.changePercent.toFixed(2)}%.
 
-REAL BREAKING NEWS & HEADLINES GATHERED LIVE FROM PREMIER RESEARCH & OUTLETS (Zacks Investment Research, Morgan Stanley, J.P. Morgan, WSJ, Bloomberg, Reuters, etc.):
-${articlesContext || 'No specific news headline found; evaluate based on market conditions, Zacks consensus revisions, and sector trends.'}
+VERIFIED RECENT HEADLINES FOR ${aliased} ONLY:
+${articlesContext}
 
-Provide an institutional-grade breaking news, catalyst, and risk alert report for today's trading session.
-Determine if there are active downside warnings (like cyberattacks, guidance cuts, regulatory probes, analyst downgrades from Zacks/Morgan) OR impending upward breakout catalysts (Zacks Rank #1, Morgan Stanley Top Pick, earnings beat).
-Ground your report in the real headlines above if present.
+Ground your report strictly in these verified headlines (do NOT invent events).
 Return strictly a JSON object adhering to this schema:
 {
   "id": "pm-${aliased.toLowerCase()}-${Date.now()}",
   "ticker": "${aliased}",
-  "companyName": "${liveQuote.companyName || aliased + ' Corporation'}",
-  "headline": string (engaging, factual Hebrew headline including any major risk or catalyst),
-  "summary": string (2-3 detailed Hebrew sentences covering recent news, SEC filings, operational issues, Zacks/Morgan analyst notes, or earnings),
-  "source": string (e.g. "זקס מחקר השקעות (Zacks Investment Research)" or "מורגן סטנלי (Morgan Stanley Research)" or "ג'יי פי מורגן (J.P. Morgan Research)" or "The Wall Street Journal (WSJ)" or "Bloomberg"),
-  "sourceUrl": "https://www.wsj.com" or "https://www.bloomberg.com",
-  "publishedTime": "08:20 AM EST",
-  "date": "היום • לקראת פתיחת המסחר",
+  "companyName": "${companyNameResolved}",
+  "headline": string (clear, factual Hebrew headline reflecting the top article),
+  "summary": string (2-3 simple Hebrew sentences summarizing what happened),
+  "source": "${topArticle.source}",
+  "sourceUrl": "${topArticle.link || topArticle.sourceUrl}",
+  "publishedTime": "${topTiming ? `${topTiming.timeLabel} · ${topTiming.dateLabel}` : 'עדכון חי'}",
+  "date": "${topTiming ? topTiming.dateLabel : 'עדכון חי'}",
   "category": "TECH_AI_CHIPS" | "HEALTHCARE_BIO" | "CONSUMER_RETAIL" | "ANALYST_RATINGS" | "MACRO_RATES" | "EARNINGS_CATALYST",
   "sentiment": "BULLISH" | "BEARISH" | "NEUTRAL",
-  "movementType": "IMPENDING_JUMP" | "SHARP_DROP_WARNING" | "VOLATILE_OPPORTUNITY",
+  "movementType": "IMPENDING_JUMP" | "SHARP_DROP_WARNING" | "VOLATILE_OPPORTUNITY" | "FORECAST_REVISION",
   "catalystType": "EARNINGS_BEAT" | "GUIDANCE_CUT" | "ANALYST_UPGRADE" | "ANALYST_DOWNGRADE" | "REGULATORY_FDA" | "PARTNERSHIP_CONTRACT" | "MACRO_HEADWIND",
   "indexOrigin": "SP_500" | "NASDAQ_100" | "BOTH",
-  "estimatedImpactPct": string (e.g. "+5% עד +9%" or "-6% עד -12%"),
+  "estimatedImpactPct": string (e.g. "+3% עד +6%" or "-3% עד -7%"),
   "catalystSeverity": "CRITICAL" | "HIGH" | "MODERATE",
   "preMarketPrice": ${liveQuote.price.toFixed(2)},
   "preMarketChangePercent": ${liveQuote.changePercent.toFixed(2)},
@@ -2777,9 +2570,9 @@ Return strictly a JSON object adhering to this schema:
     "actionLabelEn": string,
     "confidenceScore": number (82-96),
     "impactOn5YearThesis": "STRENGTHENS_MOAT" | "TEMPORARY_NOISE" | "NEUTRAL" | "THESIS_WATCH",
-    "impactAnalysisHe": string (deep institutional Hebrew analysis of moat, ROIC, and 5-year thesis),
+    "impactAnalysisHe": string,
     "impactAnalysisEn": string,
-    "openingBellGamePlanHe": string (concrete tactical instruction for market open),
+    "openingBellGamePlanHe": string,
     "openingBellGamePlanEn": string,
     "targetPrice": number,
     "buyZoneMax": number,
@@ -2800,19 +2593,20 @@ Return strictly a JSON object adhering to this schema:
       const raw = response.text || '';
       const parsed = safeParseJsonObject(raw);
       if (parsed) {
+        parsed.isLiveRss = true;
+        parsed.hasFreshNews = true;
+        parsed.rawTitleEn = topArticle.title;
         if (!parsed.reactionAnalysis) {
           parsed.reactionAnalysis = buildContextualReactionAnalysis({
             ticker: aliased,
-            title: parsed.headline || articlesContext || aliased,
-            source: parsed.source || 'Live News',
+            title: topArticle.title || parsed.headline || aliased,
+            source: parsed.source || topArticle.source,
             sentiment: parsed.sentiment || 'NEUTRAL',
             catalystType: parsed.catalystType,
             liveChangePercent: liveQuote.changePercent,
             knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[aliased]?.moatHe,
           });
         }
-        // Cache and prepend to news
-        cachedPremarketNews = [parsed, ...cachedPremarketNews.filter((n) => n.ticker !== aliased)];
         return parsed;
       }
     } catch (e: any) {
@@ -2820,15 +2614,14 @@ Return strictly a JSON object adhering to this schema:
     }
   }
 
-  // If real web article exists from WSJ, Bloomberg, Reuters, etc., synthesize it
+  // Real verified web article exists (deterministic Hebrew translation + truthful article timestamp)
   if (topArticle) {
     let effectiveSentiment = topArticle.sentiment;
     let effectiveMovement = topArticle.movementType;
     let effectiveCatalyst = topArticle.catalystType;
     let effectiveSeverity = topArticle.catalystSeverity;
 
-    // Contradiction sanity check: if stock is clearly positive or stable, don't show a false crash alert
-    if (effectiveMovement === 'SHARP_DROP_WARNING' && liveQuote.changePercent > 0.4) {
+    if (effectiveMovement === 'SHARP_DROP_WARNING' && liveQuote.changePercent > 0.5) {
       effectiveSentiment = 'NEUTRAL';
       effectiveMovement = 'FORECAST_REVISION';
       effectiveCatalyst = 'ANALYST_RATINGS';
@@ -2837,125 +2630,118 @@ Return strictly a JSON object adhering to this schema:
 
     const isBear = effectiveSentiment === 'BEARISH';
     const isBull = effectiveSentiment === 'BULLISH';
+    const realTimeLabel = topTiming ? `${topTiming.timeLabel} · ${topTiming.dateLabel}` : 'עדכון שוק';
+    const realDateLabel = topTiming ? topTiming.dateLabel : 'עדכון שוק';
+
+    const reactionAnalysis = buildContextualReactionAnalysis({
+      ticker: aliased,
+      title: topArticle.title || aliased,
+      source: topArticle.source,
+      sentiment: effectiveSentiment,
+      catalystType: effectiveCatalyst,
+      liveChangePercent: liveQuote.changePercent,
+      knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[aliased]?.moatHe,
+    });
+
     const item: any = {
       id: `pm-${aliased.toLowerCase()}-${Date.now()}`,
+      isLiveRss: true,
+      hasFreshNews: true,
+      publishedAtMs: topTiming?.timestampMs,
+      rawTitleEn: topArticle.title,
       ticker: aliased,
-      companyName: liveQuote.companyName || `${aliased} Corporation`,
+      companyName: companyNameResolved,
       headline: topArticle.headlineHe || topArticle.title,
       summary: topArticle.summaryHe || topArticle.snippet || topArticle.title,
       source: topArticle.source,
-      sourceUrl: topArticle.sourceUrl,
+      sourceUrl: topArticle.link || topArticle.sourceUrl,
       sourceLink: topArticle.link,
-      publishedTime: '08:15 AM EST',
-      date: 'היום • לקראת פתיחת המסחר',
+      publishedTime: realTimeLabel,
+      date: realDateLabel,
       category: 'EARNINGS_CATALYST',
       sentiment: effectiveSentiment,
       movementType: effectiveMovement,
       messageCategory: isBear ? 'DROP_WARNING' : isBull ? 'SHARP_RISE' : 'FORECAST_REVISION',
       catalystType: effectiveCatalyst,
       indexOrigin: 'SP_500',
-      estimatedImpactPct: isBear ? '-4% עד -10%' : isBull ? '+3% עד +8%' : '±2.5%',
+      estimatedImpactPct: reactionAnalysis.expectedMoveRange,
       catalystSeverity: effectiveSeverity,
       preMarketPrice: liveQuote.price,
       preMarketChangePercent: liveQuote.changePercent,
-      recommendation: topArticle.recommendation || {
+      recommendation: {
         action: isBear ? 'CAUTION_ALERT' : isBull ? 'STRONG_BUY' : 'HOLD_MONITOR',
-        actionLabelHe: isBear ? '⚠️ אזהרת ירידה - זהירות והמתנה' : isBull ? '🚀 מומנטום חיובי בפתיחה' : 'החזקה ומעקב',
-        actionLabelEn: isBear ? 'Caution - Wait for Support' : isBull ? 'Bullish Open Momentum' : 'Hold & Monitor',
+        actionLabelHe: isBear ? '⚠️ זהירות - מעקב והמתנה' : isBull ? '🚀 מומנטום חיובי' : 'החזקה ומעקב',
+        actionLabelEn: isBear ? 'Caution - Wait for Support' : isBull ? 'Bullish Momentum' : 'Hold & Monitor',
         confidenceScore: 90,
         impactOn5YearThesis: isBear ? 'THESIS_WATCH' : 'STRENGTHENS_MOAT',
-        impactAnalysisHe: `ניתוח מוסדי בעקבות דיווח ב-${topArticle.source}: שוק ההון בוחן את השפעת האירוע על החפיר הכלכלי ורמות התמחור של ${aliased}.`,
-        impactAnalysisEn: `Institutional assessment following report in ${topArticle.source}.`,
-        openingBellGamePlanHe: isBear
-          ? 'להמתין מחוץ למניה או לממש חלק מהפוזיציה להגנה על ההון; אין למהר לקנות בפתיחה.'
-          : 'איסוף מודרג באזורי תמיכה עם לימיט קפדני.',
-        openingBellGamePlanEn: isBear ? 'Wait for selling pressure to exhaust.' : 'Accumulate on dips.',
-        targetPrice: Number((liveQuote.price * (isBear ? 1.08 : 1.25)).toFixed(2)),
-        buyZoneMax: Number((liveQuote.price * (isBear ? 0.94 : 1.04)).toFixed(2)),
-        riskFactorHe: 'תנודתיות גבוהה סביב כותרות החדשות ותגובת אנליסטים בוול סטריט.',
-        riskFactorEn: 'Headline risk and high trading beta around opening bell.',
+        impactAnalysisHe: reactionAnalysis.whyReactingHe,
+        impactAnalysisEn: reactionAnalysis.whyReactingEn,
+        openingBellGamePlanHe: reactionAnalysis.howToRespondHe,
+        openingBellGamePlanEn: reactionAnalysis.howToRespondEn,
+        targetPrice: Number((liveQuote.price * (isBear ? 1.08 : 1.2)).toFixed(2)),
+        buyZoneMax: Number((liveQuote.price * (isBear ? 0.94 : 1.03)).toFixed(2)),
+        riskFactorHe: reactionAnalysis.isOverreactionOrRealHe,
+        riskFactorEn: reactionAnalysis.isOverreactionOrRealEn,
       },
-      reactionAnalysis: buildContextualReactionAnalysis({
-        ticker: aliased,
-        title: topArticle.title || aliased,
-        source: topArticle.source,
-        sentiment: effectiveSentiment,
-        catalystType: effectiveCatalyst,
-        liveChangePercent: liveQuote.changePercent,
-        knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[aliased]?.moatHe,
-      }),
+      reactionAnalysis,
     };
-    cachedPremarketNews = [item, ...cachedPremarketNews.filter((n) => n.ticker !== aliased)];
     return item;
   }
 
-  // Fallback Dynamic Institutional Generator for ANY stock
+  // Honest quiet-period response when NO real verified breaking news appeared in the last 21 days
+  const nowTime = new Date().toLocaleTimeString('he-IL', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Jerusalem' });
   const isPositive = liveQuote.changePercent >= 0;
-  const isSharpDrop = liveQuote.changePercent <= -2.5;
-  const item: any = {
-    id: `pm-${aliased.toLowerCase()}-${Date.now()}`,
+  const isSharpMove = Math.abs(liveQuote.changePercent) >= 2.5;
+  const moveDir = liveQuote.changePercent <= -2.5 ? 'BEARISH' : liveQuote.changePercent >= 2.5 ? 'BULLISH' : 'NEUTRAL';
+
+  return {
+    id: `pm-quiet-${aliased.toLowerCase()}-${Date.now()}`,
+    isLiveRss: false,
+    hasFreshNews: false,
     ticker: aliased,
-    companyName: liveQuote.companyName || `${aliased} Corporation`,
-    headline: isSharpDrop
-      ? `⚠️ התראת תנודתיות וסיכון ב-${aliased}: לחץ מכירות של ${liveQuote.changePercent.toFixed(2)}% ומבחן רמות תמיכה לקראת הפתיחה`
-      : isPositive
-      ? `🚀 מבזק שוק: מניית ${aliased} מרכזת עניין עם תנועה חיובית של +${liveQuote.changePercent.toFixed(2)}% לקראת פתיחת המסחר`
-      : `📊 סקירת מסחר מוסדית: מניית ${aliased} נסחרת ביציבות סביב $${liveQuote.price.toFixed(2)} במעקב תזרים ואיכות`,
-    summary: `ניתוח מערכתי מוסדי למניית ${aliased}: החברה נסחרת כעת במחיר של $${liveQuote.price.toFixed(2)} (${isPositive ? '+' : ''}${liveQuote.changePercent.toFixed(2)}%). מודלי השווי והתזרים בוחנים את יציבות החפיר הכלכלי, תשואת ההון (ROIC) וכוח התמחור מול המתחרות בענף.`,
-    source: 'Wall Street Wire / Bloomberg Terminal',
-    sourceUrl: 'https://www.bloomberg.com',
-    publishedTime: '08:30 AM EST',
-    date: 'היום • לקראת פתיחת המסחר',
+    companyName: companyNameResolved,
+    headline: isSharpMove
+      ? `📊 תנועת מסחר יומית ב-${aliased} (${isPositive ? '+' : ''}${liveQuote.changePercent.toFixed(2)}%): אין חדשות חריגות בשבועיים האחרונים`
+      : `📊 אין חדשות חריגות ל-${aliased} — מסחר שוטף סביב $${liveQuote.price.toFixed(2)} (${isPositive ? '+' : ''}${liveQuote.changePercent.toFixed(2)}%)`,
+    summary: `בבדיקת מאגרי החדשות בזמן אמת (CNBC, Google Finance, Yahoo Finance) לא נמצאו כותרות חריגות או אזהרות חדשות עבור ${companyNameResolved} (${aliased}) בימים האחרונים. המניה נסחרת כעת במחיר $${liveQuote.price.toFixed(2)}.`,
+    source: 'Live Market Tape',
+    sourceUrl: `https://finance.yahoo.com/quote/${encodeURIComponent(aliased)}`,
+    publishedTime: `${nowTime} · עדכון חי`,
+    date: 'מצב שקט • ללא חדשות חריגות',
     category: 'EARNINGS_CATALYST',
-    sentiment: isSharpDrop ? 'BEARISH' : isPositive ? 'BULLISH' : 'NEUTRAL',
-    movementType: isSharpDrop ? 'SHARP_DROP_WARNING' : isPositive ? 'IMPENDING_JUMP' : 'FORECAST_REVISION',
-    messageCategory: isSharpDrop ? 'DROP_WARNING' : isPositive ? 'SHARP_RISE' : 'FORECAST_REVISION',
-    catalystType: isSharpDrop ? 'GUIDANCE_CUT' : isPositive ? 'PARTNERSHIP_CONTRACT' : 'ANALYST_RATINGS',
+    sentiment: moveDir,
+    movementType: liveQuote.changePercent <= -2.5 ? 'SHARP_DROP_WARNING' : liveQuote.changePercent >= 2.5 ? 'IMPENDING_JUMP' : 'FORECAST_REVISION',
+    messageCategory: liveQuote.changePercent <= -2.5 ? 'DROP_WARNING' : liveQuote.changePercent >= 2.5 ? 'SHARP_RISE' : 'FORECAST_REVISION',
+    catalystType: 'MARKET_VOLATILITY',
     indexOrigin: 'SP_500',
-    estimatedImpactPct: `${isPositive ? '+' : '-'}${Math.max(2, Math.abs(liveQuote.changePercent) * 1.5).toFixed(1)}%`,
-    catalystSeverity: isSharpDrop ? 'HIGH' : 'MODERATE',
+    estimatedImpactPct: '±1.5%',
+    catalystSeverity: isSharpMove ? 'HIGH' : 'MODERATE',
     preMarketPrice: liveQuote.price,
     preMarketChangePercent: liveQuote.changePercent,
     recommendation: {
-      action: isSharpDrop ? 'CAUTION_ALERT' : isPositive ? 'ACCUMULATE_ON_DIP' : 'HOLD_MONITOR',
-      actionLabelHe: isSharpDrop ? '⚠️ אזהרת ירידה - זהירות והמתנה' : isPositive ? 'צבירה מבוקרת בירידות' : 'החזקה ומעקב',
-      actionLabelEn: isSharpDrop ? 'Caution - Wait for Support' : isPositive ? 'Accumulate on Pullback' : 'Hold & Monitor',
-      confidenceScore: 89,
-      impactOn5YearThesis: isSharpDrop ? 'THESIS_WATCH' : 'STRENGTHENS_MOAT',
-      impactAnalysisHe: `ניתוח החפיר הכלכלי של ${aliased}: בחינת עמידות המודל העסקי מראה כי יש לעקוב בדריכות אחר שיעורי הרווח הגולמי וקצב ייצור תזרים המזומנים החופשי (FCF) ברבעון הקרוב.`,
-      impactAnalysisEn: `Moat and financial quality assessment for ${aliased} examining operating margin durability and FCF conversion.`,
-      openingBellGamePlanHe: isSharpDrop
-        ? 'מומלץ להמתין מחוץ למניה ב-30 הדקות הראשונות של המסחר כדי לוודא שאינה שוברת תמיכות טכניות מרכזיות.'
-        : 'בפתיחת המסחר, הימנעו מרדיפה אחר פערים חדים וקבעו פקודות לימיט מחושבות באזורי תמיכה.',
-      openingBellGamePlanEn: 'Exercise patience at market open. Wait for price discovery and liquidity stabilization.',
-      targetPrice: Number((liveQuote.price * (isSharpDrop ? 1.15 : 1.22)).toFixed(2)),
-      buyZoneMax: Number((liveQuote.price * (isSharpDrop ? 0.95 : 1.05)).toFixed(2)),
-      riskFactorHe: 'רגישות לתנאי המאקרו ולשינויים בסנטימנט המשקיעים בסקטור.',
-      riskFactorEn: 'Macro volatility and sector-wide sentiment shifts.',
+      action: liveQuote.changePercent <= -2.5 ? 'CAUTION_ALERT' : 'HOLD_MONITOR',
+      actionLabelHe: liveQuote.changePercent <= -2.5 ? 'מעקב אחר ירידת המחיר' : 'שגרה שקטה — החזקה ומעקב',
+      actionLabelEn: 'Quiet News Flow - Monitor',
+      confidenceScore: 88,
+      impactOn5YearThesis: 'NEUTRAL',
+      impactAnalysisHe: `אין כרגע אירוע חדשותי חריג סביב ${aliased}; תנועת המחיר (${isPositive ? '+' : ''}${liveQuote.changePercent.toFixed(2)}%) משקפת דינמיקת שוק שוטפת.`,
+      impactAnalysisEn: `No material breaking headline for ${aliased}.`,
+      openingBellGamePlanHe: 'אין צורך בפעולה חפוזה — להמשיך לעקוב לפי יעדי השווי והדוח הרבעוני הבא.',
+      openingBellGamePlanEn: 'Maintain normal position discipline.',
+      targetPrice: Number((liveQuote.price * 1.15).toFixed(2)),
+      buyZoneMax: Number((liveQuote.price * 1.02).toFixed(2)),
+      riskFactorHe: 'תנודתיות שוק כללית.',
+      riskFactorEn: 'General market volatility.',
     },
     reactionAnalysis: buildContextualReactionAnalysis({
       ticker: aliased,
-      title: topArticle?.title || aliased,
-      source: 'Live Wire / Bloomberg',
-      sentiment: isSharpDrop ? 'BEARISH' : isPositive ? 'BULLISH' : 'NEUTRAL',
+      title: aliased,
+      source: 'Live Market Tape',
+      sentiment: moveDir,
       liveChangePercent: liveQuote.changePercent,
       knownMoatHe: GLOBAL_STOCK_KNOWLEDGE[aliased]?.moatHe,
     }),
   };
-
-  if (item && !item.reactionAnalysis) {
-    item.reactionAnalysis = buildContextualReactionAnalysis({
-      ticker: aliased,
-      title: item.headline || aliased,
-      source: item.source || 'Live Wire',
-      sentiment: item.sentiment || 'NEUTRAL',
-      liveChangePercent: liveQuote.changePercent,
-    });
-  }
-
-  // Prepend to cached feed
-  cachedPremarketNews = [item, ...cachedPremarketNews.filter((n) => n.ticker !== aliased)];
-  return item;
 }
 
 // 6. GET & POST /api/web-news-search - Live Multi-Source Web News Intelligence Engine
@@ -3354,19 +3140,33 @@ app.post('/api/analyze-ticker', async (req, res) => {
     const cleanTicker = SERVER_TICKER_ALIASES[cleanUpper] || SERVER_TICKER_ALIASES[rawTrimmed] || cleanUpper;
     const safeLang = typeof language === 'string' && ['he', 'en', 'de', 'fr', 'es'].includes(language) ? language : 'en';
     
-    // Check if pre-computed in universe first
+    // Fetch real live market quote + Nasdaq official exchange market cap + SEC EDGAR XBRL fundamentals in parallel
+    const [liveQuote, nasdaqSummary, secSnapshot] = await Promise.all([
+      fetchRealMarketQuote(cleanTicker),
+      fetchNasdaqMarketSummary(cleanTicker).catch(() => null),
+      fetchSecRealFinancialSnapshot(cleanTicker).catch(() => null),
+    ]);
+
+    // Check if pre-computed in universe first — still refresh live price & live marketCap so DCF/multiples stay exact
     const existing = TOP_20_SUMMARY_LIST.find((s) => s.ticker === cleanTicker);
     if (existing) {
-      const localized = localizeStock(existing, safeLang);
-      res.json({ stock: localized, source: 'precomputed_sec_audited' });
+      const cloned: any = JSON.parse(JSON.stringify(existing));
+      if (liveQuote && typeof liveQuote.price === 'number' && liveQuote.price > 0) {
+        cloned.currentPrice = `$${liveQuote.price.toFixed(2)}`;
+      }
+      if (nasdaqSummary?.marketCapB && nasdaqSummary.marketCapB > 0) {
+        cloned.marketCap =
+          nasdaqSummary.marketCapB >= 1000
+            ? `$${(nasdaqSummary.marketCapB / 1000).toFixed(2)}T`
+            : nasdaqSummary.marketCapB < 10
+            ? `$${nasdaqSummary.marketCapB.toFixed(2)}B`
+            : `$${nasdaqSummary.marketCapB.toFixed(1)}B`;
+      }
+      const localized = localizeStock(cloned, safeLang);
+      res.json({ stock: localized, source: 'precomputed_sec_live_grounded' });
       return;
     }
 
-    // Always fetch real live market quote + SEC EDGAR XBRL fundamentals first so valuation is grounded
-    const [liveQuote, secSnapshot] = await Promise.all([
-      fetchRealMarketQuote(cleanTicker),
-      fetchSecRealFinancialSnapshot(cleanTicker).catch(() => null),
-    ]);
     const knownCvsOrOther = GLOBAL_STOCK_KNOWLEDGE[cleanTicker];
     const fallbackGroundPrice = knownCvsOrOther ? knownCvsOrOther.price : '$86.00';
     const realPriceFormatted = liveQuote && typeof liveQuote.price === 'number' && liveQuote.price > 0
@@ -3384,7 +3184,7 @@ app.post('/api/analyze-ticker', async (req, res) => {
     const targetDirective = langDirectives[safeLang] || langDirectives.en;
 
     const secGroundNote = secSnapshot
-      ? `VERIFIED SEC FILING DATA (${secSnapshot.entityName}, period ${secSnapshot.periodEnd}): Revenue=${secSnapshot.revenueB ? `$${secSnapshot.revenueB.toFixed(2)}B` : 'N/A'} (${secSnapshot.revenueYoYPct !== undefined ? `${secSnapshot.revenueYoYPct >= 0 ? '+' : ''}${secSnapshot.revenueYoYPct.toFixed(1)}% YoY` : 'N/A'}), FCF=${secSnapshot.fcfB !== undefined ? `$${secSnapshot.fcfB.toFixed(2)}B` : 'N/A'}, Cash=${secSnapshot.cashB !== undefined ? `$${secSnapshot.cashB.toFixed(2)}B` : 'N/A'}, Debt=${secSnapshot.debtB !== undefined ? `$${secSnapshot.debtB.toFixed(2)}B` : 'N/A'}, Shares=${secSnapshot.sharesM ? `${secSnapshot.sharesM.toFixed(1)}M` : 'N/A'}. Do NOT invent conflicting revenue/FCF/cap numbers.`
+      ? `VERIFIED SEC FILING DATA (${secSnapshot.entityName}, period ${secSnapshot.periodEnd}): MarketCap=${nasdaqSummary?.marketCapB ? `$${nasdaqSummary.marketCapB.toFixed(1)}B` : 'N/A'}, Revenue=${secSnapshot.revenueB ? `$${secSnapshot.revenueB.toFixed(2)}B` : 'N/A'} (${secSnapshot.revenueYoYPct !== undefined ? `${secSnapshot.revenueYoYPct >= 0 ? '+' : ''}${secSnapshot.revenueYoYPct.toFixed(1)}% YoY` : 'N/A'}), FCF=${secSnapshot.fcfB !== undefined ? `$${secSnapshot.fcfB.toFixed(2)}B` : 'N/A'}, Cash=${secSnapshot.cashB !== undefined ? `$${secSnapshot.cashB.toFixed(2)}B` : 'N/A'}, Debt=${secSnapshot.debtB !== undefined ? `$${secSnapshot.debtB.toFixed(2)}B` : 'N/A'}, Shares=${secSnapshot.sharesM ? `${secSnapshot.sharesM.toFixed(1)}M` : 'N/A'}. Do NOT invent conflicting revenue/FCF/cap numbers.`
       : '';
 
     // Use Gemini 4 Hydrogen to perform live institutional research under the 30 rules
@@ -3640,7 +3440,7 @@ Return ONLY a valid JSON object matching this exact TypeScript structure:
 
     // High-precision deterministic SEC-grounded fallback generator if upstream Gemini API is unavailable
     console.log(`Using SEC-grounded institutional model for ${cleanTicker} (${secSnapshot ? 'SEC XBRL live' : 'conservative baseline'})`);
-    const fallbackStock = generateFallbackStockAudit(cleanTicker, safeLang, liveQuote, secSnapshot);
+    const fallbackStock = generateFallbackStockAudit(cleanTicker, safeLang, liveQuote, secSnapshot, nasdaqSummary);
     res.json({ stock: fallbackStock, source: secSnapshot ? 'sec_xbrl_grounded_model' : 'grounded_institutional_sec_model' });
   } catch (error) {
     console.error('Error analyzing ticker:', error);
@@ -3648,14 +3448,55 @@ Return ONLY a valid JSON object matching this exact TypeScript structure:
     const rawTicker = (ticker && typeof ticker === 'string' ? ticker.trim() : 'UNKNOWN');
     const safeTicker = SERVER_TICKER_ALIASES[rawTicker.toUpperCase()] || SERVER_TICKER_ALIASES[rawTicker] || rawTicker.toUpperCase();
     const safeLang = typeof language === 'string' && ['he', 'en', 'de', 'fr', 'es'].includes(language) ? language : 'en';
-    const [liveQuote, secSnapshot] = await Promise.all([
+    const [liveQuote, nasdaqSummary, secSnapshot] = await Promise.all([
       fetchRealMarketQuote(safeTicker).catch(() => null),
+      fetchNasdaqMarketSummary(safeTicker).catch(() => null),
       fetchSecRealFinancialSnapshot(safeTicker).catch(() => null),
     ]);
-    const fallbackStock = generateFallbackStockAudit(safeTicker, safeLang, liveQuote, secSnapshot);
+    const fallbackStock = generateFallbackStockAudit(safeTicker, safeLang, liveQuote, secSnapshot, nasdaqSummary);
     res.json({ stock: fallbackStock, source: secSnapshot ? 'sec_xbrl_grounded_model' : 'grounded_institutional_sec_model' });
   }
 });
+
+interface NasdaqMarketSummary {
+  marketCapB?: number;
+  divYieldPct?: number;
+}
+
+const nasdaqSummaryCache = new Map<string, { data: NasdaqMarketSummary | null; expiresAt: number }>();
+
+async function fetchNasdaqMarketSummary(ticker: string): Promise<NasdaqMarketSummary | null> {
+  const cleanTicker = ticker.toUpperCase().trim().replace(/-/g, '.');
+  const cached = nasdaqSummaryCache.get(cleanTicker);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.data;
+  }
+  try {
+    const ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    const res = await fetch(`https://api.nasdaq.com/api/quote/${encodeURIComponent(cleanTicker)}/summary?assetclass=stocks`, {
+      headers: { 'User-Agent': ua, Accept: 'application/json' },
+      signal: AbortSignal.timeout(4500),
+    });
+    if (!res.ok) {
+      nasdaqSummaryCache.set(cleanTicker, { data: null, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return null;
+    }
+    const json: any = await res.json();
+    const sd = json?.data?.summaryData || {};
+    const mcapRaw = String(sd.MarketCap?.value || '').replace(/,/g, '');
+    const mcapNum = Number(mcapRaw);
+    const marketCapB = !isNaN(mcapNum) && mcapNum > 0 ? Number((mcapNum / 1e9).toFixed(3)) : undefined;
+    const yieldRaw = String(sd.Yield?.value || '').replace(/[^0-9.]/g, '');
+    const divYieldNum = parseFloat(yieldRaw);
+    const divYieldPct = !isNaN(divYieldNum) && divYieldNum >= 0 ? divYieldNum : undefined;
+    const result: NasdaqMarketSummary = { marketCapB, divYieldPct };
+    nasdaqSummaryCache.set(cleanTicker, { data: result, expiresAt: Date.now() + 30 * 60 * 1000 });
+    return result;
+  } catch {
+    nasdaqSummaryCache.set(cleanTicker, { data: null, expiresAt: Date.now() + 5 * 60 * 1000 });
+    return null;
+  }
+}
 
 interface SecRealFinancialSnapshot {
   ticker: string;
@@ -3677,6 +3518,7 @@ interface SecRealFinancialSnapshot {
   debtB?: number;
   sharesM?: number;
   sharesPriorM?: number;
+  dividendsPaidB?: number;
 }
 
 const secRealFinancialCache = new Map<string, { data: SecRealFinancialSnapshot | null; expiresAt: number }>();
@@ -3725,12 +3567,41 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
     }
 
     const factsJson: any = await factsRes.json();
-    const ug = factsJson?.facts?.['us-gaap'] || {};
+    const ug = {
+      ...(factsJson?.facts?.['ifrs-full'] || {}),
+      ...(factsJson?.facts?.['us-gaap'] || {}),
+    };
     const dei = factsJson?.facts?.dei || {};
 
+    const XBRL_FX_TO_USD: Record<string, number> = {
+      USD: 1.0,
+      EUR: 1.085,
+      TWD: 0.0308,
+      CNY: 0.138,
+      RMB: 0.138,
+      DKK: 0.144,
+      GBP: 1.27,
+      JPY: 0.0065,
+      ILS: 0.275,
+      CAD: 0.72,
+      CHF: 1.13,
+    };
+
+    const pickCurrencyUnits = (tagObj: any): { arr: any[]; fx: number } => {
+      const units = tagObj?.units || {};
+      for (const cur of ['USD', 'EUR', 'TWD', 'CNY', 'RMB', 'DKK', 'GBP', 'JPY', 'ILS', 'CAD', 'CHF']) {
+        if (Array.isArray(units[cur]) && units[cur].length > 0) {
+          return { arr: units[cur], fx: XBRL_FX_TO_USD[cur] || 1 };
+        }
+      }
+      return { arr: [], fx: 1 };
+    };
+
     const extractAnnualSeries = (tagNames: string[]): { end: string; val: number }[] => {
+      let bestSeries: { end: string; val: number }[] = [];
+      let bestMaxYear = -1;
       for (const tag of tagNames) {
-        const arr: any[] = ug[tag]?.units?.USD || [];
+        const { arr, fx } = pickCurrencyUnits(ug[tag]);
         if (!arr.length) continue;
         const annual = arr.filter((pt) => {
           const isAnnualForm = pt?.form === '10-K' || pt?.form === '20-F' || pt?.form === '10-K/A' || pt?.form === '20-F/A';
@@ -3747,54 +3618,89 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
           for (const item of annual) {
             const yrKey = String(item.end).slice(0, 4);
             if (!byEnd.has(yrKey)) {
-              byEnd.set(yrKey, item.val);
+              byEnd.set(yrKey, item.val * fx);
             }
           }
-          return Array.from(byEnd.entries())
+          const series = Array.from(byEnd.entries())
             .sort((a, b) => Number(b[0]) - Number(a[0]))
             .map(([yr, val]) => ({ end: yr, val }));
+          const maxYr = Number(series[0]?.end || 0);
+          if (maxYr > bestMaxYear) {
+            bestMaxYear = maxYr;
+            bestSeries = series;
+          }
         }
       }
-      return [];
+      return bestSeries;
     };
 
     const extractLatestPoint = (tagNames: string[]): { end: string; val: number } | null => {
+      let bestPoint: { end: string; val: number } | null = null;
       for (const tag of tagNames) {
-        const arr: any[] = ug[tag]?.units?.USD || [];
+        const { arr, fx } = pickCurrencyUnits(ug[tag]);
         if (!arr.length) continue;
         const valid = arr
           .filter((pt) => typeof pt?.val === 'number' && pt?.end)
           .sort((a, b) => new Date(b.end).getTime() - new Date(a.end).getTime());
         if (valid.length > 0) {
-          return { end: String(valid[0].end), val: Number(valid[0].val) };
+          const cand = { end: String(valid[0].end), val: Number(valid[0].val) * fx };
+          if (!bestPoint || cand.end > bestPoint.end) {
+            bestPoint = cand;
+          }
         }
       }
-      return null;
+      return bestPoint;
     };
 
     const revSeries = extractAnnualSeries([
-      'Revenues',
       'RevenueFromContractWithCustomerExcludingAssessedTax',
+      'Revenues',
       'SalesRevenueNet',
       'TotalRevenuesAndOtherIncome',
+      'Revenue',
+      'RevenueFromContractsWithCustomers',
     ]);
     const grossSeries = extractAnnualSeries(['GrossProfit']);
-    const opSeries = extractAnnualSeries(['OperatingIncomeLoss']);
+    const opSeries = extractAnnualSeries(['OperatingIncomeLoss', 'ProfitLossFromOperatingActivities']);
     const netSeries = extractAnnualSeries(['NetIncomeLoss', 'ProfitLoss']);
-    const ocfSeries = extractAnnualSeries(['NetCashProvidedByUsedInOperatingActivities']);
-    const capexSeries = extractAnnualSeries(['PaymentsToAcquirePropertyPlantAndEquipment', 'CapitalExpendituresIncurredButNotYetPaid']);
+    const ocfSeries = extractAnnualSeries([
+      'NetCashProvidedByUsedInOperatingActivities',
+      'CashFlowsFromUsedInOperatingActivities',
+    ]);
+    const capexSeries = extractAnnualSeries([
+      'PaymentsToAcquirePropertyPlantAndEquipment',
+      'PaymentsToAcquireProductiveAssets',
+      'PaymentsForCapitalImprovements',
+      'PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets',
+      'CapitalExpendituresIncurredButNotYetPaid',
+      'PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
+    ]);
+    const divSeries = extractAnnualSeries([
+      'PaymentsOfDividendsCommonStock',
+      'PaymentsOfDividends',
+      'DividendsCommonStockCash',
+      'Dividends',
+      'DividendsPaid',
+    ]);
 
     const cashPoint = extractLatestPoint([
       'CashCashEquivalentsAndShortTermInvestments',
       'CashAndCashEquivalentsAtCarryingValue',
+      'CashAndCashEquivalents',
     ]);
     const ltDebtPoint = extractLatestPoint([
       'ConvertibleLongTermNotesPayable',
       'LongTermDebtNoncurrent',
       'LongTermDebt',
       'LongTermDebtAndCapitalLeaseObligations',
+      'NoncurrentFinancialLiabilities',
+      'Borrowings',
     ]);
-    const stDebtPoint = extractLatestPoint(['DebtCurrent', 'ShortTermBorrowings']);
+    const stDebtPoint = extractLatestPoint([
+      'DebtCurrent',
+      'ShortTermBorrowings',
+      'CurrentBorrowingsAndCurrentPortionOfNoncurrentBorrowings',
+    ]);
 
     // Shares outstanding
     let shareArr: any[] = dei?.EntityCommonStockSharesOutstanding?.units?.shares || [];
@@ -3822,9 +3728,10 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
     const netIncomeB = netSeries[0] ? netSeries[0].val / 1e9 : undefined;
     const ocfB = ocfSeries[0] ? ocfSeries[0].val / 1e9 : undefined;
     const capexB = capexSeries[0] ? Math.abs(capexSeries[0].val) / 1e9 : 0;
-    const fcfB = ocfB !== undefined ? Math.max(0.01, ocfB - capexB) : undefined;
+    const fcfB = ocfB !== undefined ? Number((ocfB - capexB).toFixed(4)) : undefined;
     const cashB = cashPoint ? cashPoint.val / 1e9 : undefined;
     const debtB = ((ltDebtPoint?.val || 0) + (stDebtPoint?.val || 0)) / 1e9;
+    const dividendsPaidB = divSeries[0] ? Math.abs(divSeries[0].val) / 1e9 : undefined;
 
     const snapshot: SecRealFinancialSnapshot = {
       ticker: cleanTicker,
@@ -3846,6 +3753,7 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
       debtB,
       sharesM,
       sharesPriorM,
+      dividendsPaidB,
     };
 
     secRealFinancialCache.set(cleanTicker, {
@@ -3864,7 +3772,8 @@ function generateFallbackStockAudit(
   ticker: string,
   lang: string = 'en',
   liveQuote?: LiveMarketQuote | null,
-  sec?: SecRealFinancialSnapshot | null
+  sec?: SecRealFinancialSnapshot | null,
+  nasdaqSummary?: NasdaqMarketSummary | null
 ) {
   const numericLivePrice = liveQuote && typeof liveQuote.price === 'number' && liveQuote.price > 0 ? liveQuote.price : undefined;
   const dynamicPrice = numericLivePrice ? `$${numericLivePrice.toFixed(2)}` : undefined;
@@ -3873,7 +3782,7 @@ function generateFallbackStockAudit(
   const resolvedPrice = dynamicPrice || known?.price || '$86.00';
   const priceNum = numericLivePrice || parseFloat(resolvedPrice.replace(/[^0-9.]/g, '')) || 86;
 
-  // Real company name & market cap from SEC / Yahoo when available
+  // Real company name & market cap from Nasdaq / SEC / Yahoo when available
   const resolvedCompanyName =
     known?.name ||
     liveQuote?.companyName ||
@@ -3884,8 +3793,8 @@ function generateFallbackStockAudit(
   const resolvedSector = known?.sector || (sec?.sicDescription ? 'Information Technology / Corporate' : 'Broad Market Quality');
   const resolvedIndustry = known?.industry || sec?.sicDescription || 'Publicly Traded Equity';
 
-  // Compute real market cap ($B) from shares * live price if SEC shares exist
-  const realMarketCapB =
+  // Prefer official live exchange Market Cap from Nasdaq API (accurate for ADRs & multi-class shares), then SEC shares * live price
+  const secMarketCapB =
     sec?.sharesM && sec.sharesM > 0
       ? Number(((sec.sharesM / 1000) * priceNum).toFixed(2))
       : undefined;
@@ -3893,15 +3802,23 @@ function generateFallbackStockAudit(
   const parsedKnownCapB = knownCapMatch
     ? parseFloat(knownCapMatch[1]) * (knownCapMatch[2].toUpperCase() === 'T' ? 1000 : 1)
     : undefined;
-  const capB = realMarketCapB || parsedKnownCapB || Number((priceNum * 0.15).toFixed(2));
-  const resolvedCapStr = capB >= 1000 ? `$${(capB / 1000).toFixed(2)}T` : `$${capB.toFixed(1)}B`;
+  const capB = nasdaqSummary?.marketCapB || secMarketCapB || parsedKnownCapB || Number((priceNum * 0.15).toFixed(2));
+  const resolvedCapStr = capB >= 1000 ? `$${(capB / 1000).toFixed(2)}T` : capB < 10 ? `$${capB.toFixed(2)}B` : `$${capB.toFixed(1)}B`;
+  const fmtMoneyB = (valB: number): string => {
+    const abs = Math.abs(valB);
+    const sign = valB < 0 ? '-' : '';
+    if (abs > 0 && abs < 0.5) return `${sign}$${(abs * 1000).toFixed(1)}M`;
+    return `${sign}$${abs.toFixed(2)}B`;
+  };
 
-  // Real revenue, FCF, cash, debt, margins from SEC EDGAR (or conservative market-cap-proportional fallback — NEVER hardcoded $65B/$18.4B)
-  const revenueB = sec?.revenueB ?? Number((capB * 0.22).toFixed(2));
+  // Real revenue, FCF, cash, debt, margins from SEC EDGAR (or fwdPE-proportional fallback)
+  const fwdPeFallbackNum = parseFloat((known?.fwdPe || '24.0').replace(/[^0-9.]/g, '')) || 24.0;
+  const fcfB = sec?.fcfB ?? Number((capB / (fwdPeFallbackNum * 1.15)).toFixed(2));
+  const fcfEffectiveB = fcfB > 0 ? fcfB : Math.max(0.05, sec?.netIncomeB ?? capB * 0.03);
+  const revenueB = sec?.revenueB ?? Number((fcfEffectiveB / 0.24).toFixed(2));
   const revYoYPct = sec?.revenueYoYPct !== undefined ? sec.revenueYoYPct : 8.5;
-  const fcfB = sec?.fcfB ?? Number((capB * 0.042).toFixed(2));
-  const ocfB = sec?.ocfB ?? Number((fcfB * 1.05).toFixed(2));
-  const netIncomeB = sec?.netIncomeB ?? Number((fcfB * 0.92).toFixed(2));
+  const ocfB = sec?.ocfB ?? Number((fcfEffectiveB * 1.05).toFixed(2));
+  const netIncomeB = sec?.netIncomeB ?? Number((fcfEffectiveB * 0.92).toFixed(2));
   const operatingIncomeB = sec?.operatingIncomeB ?? Number((revenueB * 0.22).toFixed(2));
   const cashB = sec?.cashB ?? Number((capB * 0.12).toFixed(2));
   const debtB = sec?.debtB ?? Number((capB * 0.08).toFixed(2));
@@ -3913,13 +3830,13 @@ function generateFallbackStockAudit(
       : 54.0;
   const opMarginPct = revenueB > 0 ? Math.min(80, Math.max(-50, (operatingIncomeB / revenueB) * 100)) : 22.0;
   const netMarginPct = revenueB > 0 ? Math.min(80, Math.max(-50, (netIncomeB / revenueB) * 100)) : 18.0;
-  const fcfMarginPct = revenueB > 0 ? Math.min(80, Math.max(-50, (fcfB / revenueB) * 100)) : 20.0;
-  const fcfConversionPct = netIncomeB > 0 ? Math.min(250, Math.max(20, (fcfB / netIncomeB) * 100)) : 102.0;
+  const fcfMarginPct = revenueB > 0 ? Math.min(80, Math.max(-80, (fcfB / revenueB) * 100)) : 20.0;
+  const fcfConversionPct = netIncomeB > 0 && fcfB > 0 ? Math.min(250, Math.max(20, (fcfB / netIncomeB) * 100)) : fcfB <= 0 ? 0 : 102.0;
 
   // Valuation multiples calculated directly from real Market Cap, Enterprise Value & Earnings/FCF
   const evB = Math.max(0.2, capB + netDebtB);
   const fcfYieldPct = capB > 0 ? (fcfB / capB) * 100 : 4.2;
-  const evToFCF = fcfB > 0 ? evB / fcfB : 22.0;
+  const evToFCF = fcfB > 0 ? evB / fcfB : 35.0;
   const peTTM = netIncomeB > 0 ? capB / netIncomeB : 24.0;
   const fwdPE = netIncomeB > 0 ? peTTM * 0.92 : parseFloat((known?.fwdPe || '21.0').replace(/[^0-9.]/g, '')) || 21.0;
   const psRatio = revenueB > 0 ? capB / revenueB : 4.5;
@@ -3927,10 +3844,10 @@ function generateFallbackStockAudit(
   // Honest dynamic scoring based on actual fundamental metrics (NOT static 82!)
   const calcGrowthScore = Math.round(Math.min(96, Math.max(45, 58 + revYoYPct * 1.4)));
   const calcQualityScore = Math.round(
-    Math.min(96, Math.max(50, 60 + Math.max(0, opMarginPct) * 0.6 + (netDebtB <= 0 ? 8 : -Math.min(12, netDebtB / Math.max(0.2, fcfB)))))
+    Math.min(96, Math.max(50, 60 + Math.max(0, opMarginPct) * 0.6 + (netDebtB <= 0 ? 8 : -Math.min(12, netDebtB / Math.max(0.2, fcfEffectiveB)))))
   );
   const calcValuationScore = Math.round(
-    Math.min(94, Math.max(42, 55 + Math.min(35, fcfYieldPct * 4.5) - Math.max(0, peTTM - 25) * 0.6))
+    Math.min(94, Math.max(42, 55 + Math.min(35, Math.max(-10, fcfYieldPct) * 4.5) - Math.max(0, peTTM - 25) * 0.6))
   );
   const calcMoatScore = known ? Math.min(95, known.score + 2) : Math.round(Math.min(90, Math.max(60, 62 + opMarginPct * 0.55)));
   const calcPerShareScore =
@@ -3948,17 +3865,17 @@ function generateFallbackStockAudit(
           calcAnalystScore * 0.05
       );
 
-  // Realistic 5Y CAGR expectation aligned with growth + FCF yield + buybacks
-  const cagrLow = Math.max(4.5, Math.min(22, Number((revYoYPct * 0.6 + fcfYieldPct * 0.55).toFixed(1))));
+  // Realistic 5Y CAGR expectation aligned with forward growth + capped FCF yield + buybacks
+  const cagrLow = Math.max(4.5, Math.min(18.5, Number((Math.min(22, Math.max(2, revYoYPct)) * 0.52 + Math.min(7.5, Math.max(0, fcfYieldPct)) * 0.45).toFixed(1))));
   const cagrHigh = Number((cagrLow + 3.5).toFixed(1));
   const resolvedCagrRange = known?.cagr || `${cagrLow}% – ${cagrHigh}%`;
   const roicEstStr = known?.roic || `${Math.min(45, Math.max(9, Math.round(opMarginPct * 0.72))).toFixed(1)}%`;
 
-  // Realistic 12M analyst price target derived from live price & fundamentals (e.g., +10% to +22%)
-  const impliedTargetUpsidePct = Math.round(Math.min(25, Math.max(-5, (fcfYieldPct - 3.0) * 3.2 + (revYoYPct - 5) * 0.6 + 8)));
+  // Realistic 12M analyst price target derived from live price & fundamentals (e.g., +8% to +22%)
+  const impliedTargetUpsidePct = Math.round(Math.min(24, Math.max(-5, (Math.max(0, fcfYieldPct) - 3.0) * 3.0 + (revYoYPct - 5) * 0.55 + 8)));
   const consensusTargetNum = Number((priceNum * (1 + impliedTargetUpsidePct / 100)).toFixed(2));
 
-  // Detect real red flags (e.g. margin compression or slower top-line growth or new debt)
+  // Detect real red flags (e.g. margin compression or slower top-line growth or negative FCF CapEx cycle)
   const operatingMarginDeclined =
     sec?.operatingIncomeB !== undefined &&
     sec?.operatingIncomePriorB !== undefined &&
@@ -3971,9 +3888,16 @@ function generateFallbackStockAudit(
     ? known?.moatHe || `מעמד תחרותי בענף ${resolvedIndustry}, שולי רווח תפעולי של ${opMarginPct.toFixed(1)}% ומאזן ${netDebtB <= 0 ? 'עודף מזומנים נטו' : 'מאוזן'}.`
     : known?.moat || `Established competitive positioning in ${resolvedIndustry} with ${opMarginPct.toFixed(1)}% operating margin.`;
 
+  const divYieldPct =
+    nasdaqSummary?.divYieldPct !== undefined
+      ? nasdaqSummary.divYieldPct
+      : sec?.dividendsPaidB !== undefined && capB > 0
+      ? Math.min(12, Math.max(0, (sec.dividendsPaidB / capB) * 100))
+      : 0;
+
   const thesisSummary = isHe
-    ? `${resolvedCompanyName} (${ticker}) מדווחת על הכנסות שנתיות של $${revenueB.toFixed(2)}B (${revYoYPct >= 0 ? '+' : ''}${revYoYPct.toFixed(1)}% בשנה האחרונה), תזרים מזומנים חופשי (FCF) של $${fcfB.toFixed(2)}B ותשואת FCF של ${fcfYieldPct.toFixed(1)}%. ${netDebtB <= 0 ? `לקופה מזומן נטו של $${Math.abs(netDebtB).toFixed(2)}B` : `חוב נטו של $${netDebtB.toFixed(2)}B`}. מכפיל EV/FCF עומד על ${evToFCF.toFixed(1)}x וצפי הצמיחה השנתי המורכב (CAGR) הוא ${resolvedCagrRange}.`
-    : `${resolvedCompanyName} (${ticker}) generates $${revenueB.toFixed(2)}B in annual revenue (${revYoYPct >= 0 ? '+' : ''}${revYoYPct.toFixed(1)}% YoY) and $${fcfB.toFixed(2)}B in Free Cash Flow (${fcfYieldPct.toFixed(1)}% FCF yield at $${priceNum.toFixed(2)}). Trading at ${evToFCF.toFixed(1)}x EV/FCF with ${netDebtB <= 0 ? `$${Math.abs(netDebtB).toFixed(2)}B net cash` : `$${netDebtB.toFixed(2)}B net debt`}.`;
+    ? `${resolvedCompanyName} (${ticker}) מדווחת על הכנסות שנתיות של ${fmtMoneyB(revenueB)} (${revYoYPct >= 0 ? '+' : ''}${revYoYPct.toFixed(1)}% בשנה האחרונה), תזרים מזומנים חופשי (FCF) של ${fmtMoneyB(fcfB)} ותשואת FCF של ${fcfYieldPct.toFixed(1)}%. ${netDebtB <= 0 ? `לקופה מזומן נטו של ${fmtMoneyB(Math.abs(netDebtB))}` : `חוב נטו של ${fmtMoneyB(netDebtB)}`}. מכפיל EV/FCF עומד על ${evToFCF.toFixed(1)}x וצפי הצמיחה השנתי המורכב (CAGR) הוא ${resolvedCagrRange}.`
+    : `${resolvedCompanyName} (${ticker}) generates ${fmtMoneyB(revenueB)} in annual revenue (${revYoYPct >= 0 ? '+' : ''}${revYoYPct.toFixed(1)}% YoY) and ${fmtMoneyB(fcfB)} in Free Cash Flow (${fcfYieldPct.toFixed(1)}% FCF yield at $${priceNum.toFixed(2)}). Trading at ${evToFCF.toFixed(1)}x EV/FCF with ${netDebtB <= 0 ? `${fmtMoneyB(Math.abs(netDebtB))} net cash` : `${fmtMoneyB(netDebtB)} net debt`}.`;
 
   const growthDrivers = isHe
     ? [
@@ -4083,23 +4007,23 @@ function generateFallbackStockAudit(
       operatingMargin: { value: `${opMarginPct.toFixed(1)}%`, period: periodLabel, source: secCitation },
       netMargin: { value: `${netMarginPct.toFixed(1)}%`, period: periodLabel, source: secCitation },
       yearsProfitableInLast10: 10,
-      fcfTTM: { value: `$${fcfB.toFixed(2)}B`, period: periodLabel, source: secCitation },
+      fcfTTM: { value: fmtMoneyB(fcfB), period: periodLabel, source: secCitation },
       fcfMargin: { value: `${fcfMarginPct.toFixed(1)}%`, period: periodLabel, source: secCitation },
       fcfCAGR5Y: { value: `${Math.max(4, revYoYPct + 1.5).toFixed(1)}%`, period: '5Y Est.', source: secCitation },
       fcfConversionRate: `${fcfConversionPct.toFixed(1)}%`,
       netDebt: {
-        value: netDebtB <= 0 ? `-$${Math.abs(netDebtB).toFixed(2)}B (Net Cash)` : `$${netDebtB.toFixed(2)}B`,
+        value: netDebtB <= 0 ? `-${fmtMoneyB(Math.abs(netDebtB))} (Net Cash)` : fmtMoneyB(netDebtB),
         period: 'Current',
         source: secCitation,
       },
-      netDebtToEBITDA: { value: netDebtB <= 0 ? 'Net Cash' : `${(netDebtB / Math.max(0.2, operatingIncomeB * 1.1)).toFixed(1)}x`, period: 'Current', source: secCitation },
-      interestCoverage: { value: debtB > 0.1 ? `${Math.round(operatingIncomeB / Math.max(0.02, debtB * 0.04))}x` : 'No Net Debt', period: 'Current', source: secCitation },
-      cashAndEquivalents: { value: `$${cashB.toFixed(2)}B`, period: 'Current', source: secCitation },
+      netDebtToEBITDA: { value: netDebtB <= 0 ? 'Net Cash' : `${(netDebtB / Math.max(0.05, operatingIncomeB * 1.1)).toFixed(1)}x`, period: 'Current', source: secCitation },
+      interestCoverage: { value: debtB > 0.05 ? `${Math.round(operatingIncomeB / Math.max(0.005, debtB * 0.04))}x` : 'No Net Debt', period: 'Current', source: secCitation },
+      cashAndEquivalents: { value: fmtMoneyB(cashB), period: 'Current', source: secCitation },
       balanceSheetHealth: netDebtB <= 0 ? 'Pristine' : 'Strong',
     },
     growth: {
       score: calcGrowthScore,
-      revenueTTM: { value: `$${revenueB.toFixed(2)}B`, period: periodLabel, source: secCitation },
+      revenueTTM: { value: fmtMoneyB(revenueB), period: periodLabel, source: secCitation },
       revenueYoY: { value: `${revYoYPct >= 0 ? '+' : ''}${revYoYPct.toFixed(1)}%`, period: 'YoY', source: secCitation },
       revenueCAGR3Y: { value: `${Math.max(2, revYoYPct).toFixed(1)}%`, period: '3Y', source: secCitation },
       revenueCAGR5Y: { value: `${cagrLow.toFixed(1)}%`, period: '5Y Est.', source: secCitation },
@@ -4121,8 +4045,8 @@ function generateFallbackStockAudit(
           : 'Disciplined Share Count',
       buybackYield: sec?.sharesM && sec?.sharesPriorM && sec.sharesM < sec.sharesPriorM ? '2.5%' : '1.0%',
       sbcAsPercentRevenue: '3.2%',
-      dividendYield: '0.0%',
-      dividendCAGR5Y: 'N/A',
+      dividendYield: `${divYieldPct.toFixed(1)}%`,
+      dividendCAGR5Y: divYieldPct > 0.5 ? 'Growing' : 'N/A',
       truePerShareCreationVerdict: isHe
         ? 'צמצום עקבי של כמות המניות המדוללות באמצעות תזרים מזומנים חופשי.'
         : 'Consistent per-share value compounding through FCF generation and share repurchases.',
@@ -4148,7 +4072,7 @@ function generateFallbackStockAudit(
       consensus: impliedTargetUpsidePct >= 18 ? 'Buy' : impliedTargetUpsidePct >= 8 ? 'Buy' : 'Hold',
       analystCoverageCount: 28,
       consensusForwardEPS: { value: `$${(priceNum / Math.max(5, fwdPE)).toFixed(2)}`, period: 'NTM', source: 'Derived from Fwd P/E' },
-      consensusForwardRevenue: { value: `$${(revenueB * (1 + Math.max(0.03, revYoYPct / 100))).toFixed(2)}B`, period: 'NTM', source: 'SEC Grounded' },
+      consensusForwardRevenue: { value: fmtMoneyB(revenueB * (1 + Math.max(0.03, revYoYPct / 100))), period: 'NTM', source: 'SEC Grounded' },
       epsRevisions30D: revYoYPct >= 10 ? '+7 Up / 2 Down' : '+3 Up / 3 Down',
       epsRevisions90D: revYoYPct >= 10 ? '+14 Up / 4 Down' : '+6 Up / 5 Down',
       averagePriceTarget: { value: `$${consensusTargetNum.toFixed(2)}`, period: '12M Target', source: 'Grounded Consensus' },
@@ -4190,9 +4114,9 @@ function generateFallbackStockAudit(
     },
     redFlags: redFlagsList,
     scenarios: {
-      bearCase: { revenueGrowthCAGR: `${Math.max(2, revYoYPct * 0.5).toFixed(1)}%`, operatingMarginExit: `${Math.max(10, opMarginPct - 3).toFixed(1)}%`, exitMultiplePE: `${Math.max(10, Math.round(peTTM * 0.8))}x`, exitMultipleEV_FCF: `${Math.max(9, Math.round(evToFCF * 0.78))}x`, expectedCAGR: `${Math.max(2, cagrLow - 4).toFixed(1)}%`, assumptions: isHe ? 'האטה בהוצאות ארגוניות ושחיקה קלה במרווחים.' : 'Slower enterprise demand and modest margin compression.' },
-      baseCase: { revenueGrowthCAGR: `${Math.max(4, revYoYPct).toFixed(1)}%`, operatingMarginExit: `${opMarginPct.toFixed(1)}%`, exitMultiplePE: `${Math.round(peTTM)}x`, exitMultipleEV_FCF: `${Math.round(evToFCF)}x`, expectedCAGR: `${((cagrLow + cagrHigh) / 2).toFixed(1)}%`, assumptions: isHe ? 'שימור קצב צמיחה יציב, רכישה עצמית והגנה על שולי הרווח.' : 'Steady growth execution and continued share repurchases.' },
-      bullCase: { revenueGrowthCAGR: `${(Math.max(5, revYoYPct) + 4).toFixed(1)}%`, operatingMarginExit: `${(opMarginPct + 2.5).toFixed(1)}%`, exitMultiplePE: `${Math.round(peTTM * 1.2)}x`, exitMultipleEV_FCF: `${Math.round(evToFCF * 1.25)}x`, expectedCAGR: `${(cagrHigh + 3.5).toFixed(1)}%`, assumptions: isHe ? 'האצה משמעותית במנועי הצמיחה החדשים והתרחבות מכפיל.' : 'Accelerated product adoption driving multiple re-rating.' },
+      bearCase: { revenueGrowthCAGR: `${Math.max(2, Math.min(12, revYoYPct * 0.45)).toFixed(1)}%`, operatingMarginExit: `${Math.max(10, opMarginPct - 3).toFixed(1)}%`, exitMultiplePE: `${Math.max(10, Math.round(peTTM * 0.8))}x`, exitMultipleEV_FCF: `${Math.max(9, Math.round(evToFCF * 0.78))}x`, expectedCAGR: `${Math.max(2, cagrLow - 4).toFixed(1)}%`, assumptions: isHe ? 'האטה בהוצאות ארגוניות ושחיקה קלה במרווחים.' : 'Slower enterprise demand and modest margin compression.' },
+      baseCase: { revenueGrowthCAGR: `${Math.min(22.0, Math.max(4, revYoYPct > 24 ? 12 + (revYoYPct - 24) * 0.25 : revYoYPct)).toFixed(1)}%`, operatingMarginExit: `${opMarginPct.toFixed(1)}%`, exitMultiplePE: `${Math.round(peTTM)}x`, exitMultipleEV_FCF: `${Math.round(evToFCF)}x`, expectedCAGR: `${((cagrLow + cagrHigh) / 2).toFixed(1)}%`, assumptions: isHe ? 'שימור קצב צמיחה יציב, רכישה עצמית והגנה על שולי הרווח.' : 'Steady growth execution and continued share repurchases.' },
+      bullCase: { revenueGrowthCAGR: `${Math.min(28.0, Math.max(5, revYoYPct > 24 ? 16 + (revYoYPct - 24) * 0.3 : revYoYPct + 4)).toFixed(1)}%`, operatingMarginExit: `${(opMarginPct + 2.5).toFixed(1)}%`, exitMultiplePE: `${Math.round(peTTM * 1.2)}x`, exitMultipleEV_FCF: `${Math.round(evToFCF * 1.25)}x`, expectedCAGR: `${(cagrHigh + 3.5).toFixed(1)}%`, assumptions: isHe ? 'האצה משמעותית במנועי הצמיחה החדשים והתרחבות מכפיל.' : 'Accelerated product adoption driving multiple re-rating.' },
       expected5YCAGRRange: resolvedCagrRange,
       keyDrivers: growthDrivers,
     },

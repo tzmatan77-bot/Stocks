@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import { ResearchStock } from '../types';
 import { SupportedLanguage, translations } from '../i18n';
 import { localizeStock } from '../data/stockLocalization';
-import { getResearchStock, resolveTickerSymbol } from '../data/researchStockGenerator';
+import { getResearchStock, registerResearchedStock, resolveTickerSymbol } from '../data/researchStockGenerator';
 import { getStockCompetitiveProfile } from '../data/thesisAndCompetitiveData';
 import { StockLogoBadge } from './StockLogoBadge';
 import { StockLiveChart } from './StockLiveChart';
@@ -78,9 +78,10 @@ export const LiveTickerAnalyzer: React.FC<LiveTickerAnalyzerProps> = ({
 
       const contentType = response.headers.get('content-type') || '';
       if (response.ok && contentType.includes('application/json')) {
-        const data = await response.json();
-        if (data.stock) {
+        const data = await response.json().catch(() => null);
+        if (data?.stock) {
           resolvedStock = data.stock;
+          registerResearchedStock(data.stock);
         }
       }
     } catch (err: any) {

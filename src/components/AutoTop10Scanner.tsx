@@ -202,7 +202,8 @@ export const AutoTop10Scanner: React.FC<AutoTop10ScannerProps> = ({
         matchesIndex = item.indexCategory === selectedIndexFilter;
       } else if (selectedIndexFilter === 'BUY_ZONE' || selectedIndexFilter === 'BELOW_FAIR_VALUE' || selectedIndexFilter === 'ABOVE_ENTRY') {
         const stockObj = stocks.find((s) => s.ticker === item.ticker) || getResearchStock(item.ticker);
-        const liveP = livePrices[item.ticker]?.price || KNOWN_CATALOG_PRICES[item.ticker] || 100;
+        const parsedStockP = parseFloat((stockObj.currentPrice || '').replace(/[^0-9.]/g, ''));
+        const liveP = livePrices[item.ticker]?.price || KNOWN_CATALOG_PRICES[item.ticker] || (!isNaN(parsedStockP) && parsedStockP > 0 ? parsedStockP : 100);
         const val = calculateMultiModelValuation(stockObj, liveP);
         if (selectedIndexFilter === 'BUY_ZONE') {
           matchesIndex = liveP <= val.buyZoneThreshold;

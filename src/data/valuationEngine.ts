@@ -93,12 +93,12 @@ export function extractFinancialInputs(stock: ResearchStock, livePrice?: number,
   // 1. Current Price
   const rawPriceStr = (stock.currentPrice || '').replace(/[^0-9.]/g, '');
   const parsedPrice = parseFloat(rawPriceStr);
-  const currentPrice = livePrice && livePrice > 0 
-    ? livePrice 
-    : (!isNaN(parsedPrice) && parsedPrice > 0 ? parsedPrice : 100);
+  const snapshotPrice = !isNaN(parsedPrice) && parsedPrice > 0 ? parsedPrice : 100;
+  const currentPrice = livePrice && livePrice > 0 ? livePrice : snapshotPrice;
 
   const parseToBillions = (raw: string, fallback: number): number => {
-    const m = (raw || '').match(/([0-9]+(?:\.[0-9]+)?)\s*([TBMK])?/i);
+    const cleaned = (raw || '').replace(/,/g, '');
+    const m = cleaned.match(/([0-9]+(?:\.[0-9]+)?)\s*([TBMK])?/i);
     if (!m) return fallback;
     const val = parseFloat(m[1]);
     if (isNaN(val)) return fallback;
@@ -109,9 +109,9 @@ export function extractFinancialInputs(stock: ResearchStock, livePrice?: number,
     return val;
   };
 
-  // 2. Shares Outstanding (Billions)
+  // 2. Shares Outstanding (Billions) — anchored to marketCap / snapshotPrice
   const parsedCap = parseToBillions(stock.marketCap || '', 250);
-  const autoShares = Math.max(0.01, parsedCap / currentPrice);
+  const autoShares = Math.max(0.005, parsedCap / snapshotPrice);
   const sharesBillion = overrides?.sharesBillion !== undefined && overrides.sharesBillion > 0 
     ? overrides.sharesBillion 
     : autoShares;
@@ -199,8 +199,10 @@ export function calculateMultiModelValuation(
   const baseWacc = overrides?.discountRateWACC !== undefined ? overrides.discountRateWACC : 8.5;
   const baseGrowth = overrides?.fcfGrowthRate !== undefined ? overrides.fcfGrowthRate : inputs.baseCagr;
   
-  // Terminal multiple: calibrated to moat & sector
-  const defaultTerminalMultiple = inputs.roic >= 30 ? 28 : inputs.roic >= 20 ? 22 : 17;
+  // Terminal multiple: calibrated to BOTH moat/ROIC & sustainable growth
+  const roicBaseMult = inputs.roic >= 30 ? 28 : inputs.roic >= 20 ? 22 : 17;
+  const growthCapMult = baseGrowth >= 16 ? 30 : baseGrowth >= 12 ? 24 : baseGrowth >= 9 ? 19 : 15;
+  const defaultTerminalMultiple = Math.round(roicBaseMult * 0.45 + growthCapMult * 0.55);
   const baseTerminalMultiple = overrides?.terminalMultiple !== undefined ? overrides.terminalMultiple : defaultTerminalMultiple;
 
   // Helper: Run DCF for a specific growth, multiple and WACC
@@ -249,8 +251,8 @@ export function calculateMultiModelValuation(
   // Evaluates intrinsic value based on normalized FCF per share and forward earnings power
   const fcfPerShare = inputs.baseFcfBillion / inputs.sharesBillion;
   const epsEst = inputs.currentPrice / Math.max(5, inputs.forwardPE);
-  const normalizedP_FCF = inputs.roic >= 28 ? 26 : inputs.roic >= 18 ? 21 : 16;
-  const targetPE = inputs.roic >= 28 ? 25 : inputs.roic >= 18 ? 20 : 15;
+  const normalizedP_FCF = Math.round(((inputs.roic >= 28 ? 26 : inputs.roic >= 18 ? 21 : 16) * 0.45) + (growthCapMult * 0.55));
+  const targetPE = Math.round(((inputs.roic >= 28 ? 25 : inputs.roic >= 18 ? 20 : 15) * 0.45) + ((growthCapMult - 1) * 0.55));
   const multiplesPerShare = Number(((fcfPerShare * normalizedP_FCF * 0.55) + (epsEst * targetPE * 0.45)).toFixed(2));
 
   // 3. MODEL 3: Fundamental ROIC Reinvestment & Economic Value Added (EVA) Model

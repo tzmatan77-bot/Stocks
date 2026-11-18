@@ -2,7 +2,6 @@ import React, { useState, useEffect, useMemo } from 'react';
 import { ResearchStock, WatchlistItem, PremarketNewsItem, NamedWatchlist } from '../types';
 import { StockLogoBadge } from './StockLogoBadge';
 import { SupportedLanguage } from '../i18n';
-import { INITIAL_PREMARKET_NEWS_FEED } from '../data/premarketNewsData';
 import {
   BellRing,
   Sparkles,
@@ -52,7 +51,8 @@ export const PremarketNewsIntelligence: React.FC<PremarketNewsIntelligenceProps>
 }) => {
   const isHe = currentLang === 'he';
 
-  const [newsList, setNewsList] = useState<PremarketNewsItem[]>(INITIAL_PREMARKET_NEWS_FEED);
+  const [newsList, setNewsList] = useState<PremarketNewsItem[]>([]);
+  const [isInitialLoading, setIsInitialLoading] = useState<boolean>(true);
   const [isRefreshingFeed, setIsRefreshingFeed] = useState<boolean>(false);
   const [reactionFilter, setReactionFilter] = useState<ReactionFilter>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -142,7 +142,7 @@ export const PremarketNewsIntelligence: React.FC<PremarketNewsIntelligenceProps>
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
-        if (Array.isArray(data.news) && data.news.length > 0) {
+        if (Array.isArray(data.news)) {
           setNewsList(data.news);
           setLastRefreshedAt(new Date());
           if (!isBackground) {
@@ -153,6 +153,8 @@ export const PremarketNewsIntelligence: React.FC<PremarketNewsIntelligenceProps>
       }
     } catch {
       // keep existing items smoothly
+    } finally {
+      setIsInitialLoading(false);
     }
   };
 
@@ -673,7 +675,19 @@ export const PremarketNewsIntelligence: React.FC<PremarketNewsIntelligenceProps>
 
       {/* 3. DAILY NEWS & REACTION ANALYSIS FEED */}
       <div className="space-y-4">
-        {filteredNews.length === 0 ? (
+        {isInitialLoading ? (
+          <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-10 text-center space-y-3">
+            <RefreshCw className="w-8 h-8 text-cyan-400 mx-auto animate-spin" />
+            <h3 className="text-base font-bold text-slate-200">
+              {isHe ? 'טוען חדשות שוק עדכניות להיום...' : "Loading today's verified market news..."}
+            </h3>
+            <p className="text-xs text-slate-400 max-w-md mx-auto">
+              {isHe
+                ? 'מסנן כותרות לא רלוונטיות ומביא עדכונים חיים מ-CNBC, Wall Street Journal ו-Yahoo Finance.'
+                : 'Filtering out noise and pulling live verified updates.'}
+            </p>
+          </div>
+        ) : filteredNews.length === 0 ? (
           <div className="bg-slate-900/70 border border-slate-800 rounded-2xl p-10 text-center space-y-3">
             <BellRing className="w-9 h-9 text-slate-600 mx-auto" />
             <h3 className="text-base font-bold text-slate-200">

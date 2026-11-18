@@ -1,3 +1,4 @@
+import { ResearchStock } from '../types';
 import { KNOWN_CATALOG_PRICES, getResearchStock } from './researchStockGenerator';
 import { MARKET_UNIVERSE_CATALOG } from './marketUniverseData';
 import { calculateMultiModelValuation, MultiModelValuationResult } from './valuationEngine';
@@ -535,7 +536,7 @@ export const THESIS_COMPETITIVE_DATABASE: Record<string, StockCompetitiveProfile
 
 // Fallback generator for other stocks in universe
 export function getStockCompetitiveProfile(
-  stock: { ticker: string; companyName: string; currentPrice?: string; investmentScore?: number },
+  stock: ResearchStock | { ticker: string; companyName: string; currentPrice?: string; investmentScore?: number },
   currentPriceNum?: number
 ): StockCompetitiveProfile {
   const cleanTicker = (stock.ticker || '').toUpperCase();
@@ -548,8 +549,9 @@ export function getStockCompetitiveProfile(
     ? currentPriceNum
     : (!isNaN(parsedPrice) && parsedPrice > 0 ? parsedPrice : (knownPrice || 100));
 
-  // Always compute bottom-up multi-model valuation
-  const fullStock = getResearchStock(cleanTicker);
+  // Always compute bottom-up multi-model valuation using real passed ResearchStock data when present
+  const hasFullFinancials = 'financialQuality' in stock && Boolean(stock.financialQuality?.fcfTTM);
+  const fullStock = hasFullFinancials ? (stock as ResearchStock) : getResearchStock(cleanTicker, basePrice);
   const valResult = calculateMultiModelValuation(fullStock, basePrice);
 
   if (THESIS_COMPETITIVE_DATABASE[cleanTicker]) {

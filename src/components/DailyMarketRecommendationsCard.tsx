@@ -3,7 +3,6 @@ import { ResearchStock, WatchlistItem, PremarketNewsItem } from '../types';
 import { StockLogoBadge } from './StockLogoBadge';
 import { QuickActionPlusMenu } from './QuickActionPlusMenu';
 import { SupportedLanguage } from '../i18n';
-import { INITIAL_PREMARKET_NEWS_FEED } from '../data/premarketNewsData';
 import {
   TrendingUp,
   TrendingDown,
@@ -55,7 +54,8 @@ export const DailyMarketRecommendationsCard: React.FC<DailyMarketRecommendationP
   const [selectedFilter, setSelectedFilter] = useState<'ALL' | 'BUY'>('ALL');
   const [lastRefreshed, setLastRefreshed] = useState<Date>(new Date());
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
-  const [liveNewsFeed, setLiveNewsFeed] = useState<PremarketNewsItem[]>(INITIAL_PREMARKET_NEWS_FEED);
+  const [liveNewsFeed, setLiveNewsFeed] = useState<PremarketNewsItem[]>([]);
+  const [isLoadingFeed, setIsLoadingFeed] = useState<boolean>(true);
 
   useEffect(() => {
     let isMounted = true;
@@ -64,13 +64,15 @@ export const DailyMarketRecommendationsCard: React.FC<DailyMarketRecommendationP
         const res = await fetch('/api/premarket-news', { headers: { Accept: 'application/json' } });
         if (res.ok && (res.headers.get('content-type') || '').includes('application/json')) {
           const data = await res.json();
-          if (isMounted && Array.isArray(data.news) && data.news.length > 0) {
+          if (isMounted && Array.isArray(data.news)) {
             setLiveNewsFeed(data.news);
             setLastRefreshed(new Date());
           }
         }
       } catch {
         // quiet fallback
+      } finally {
+        if (isMounted) setIsLoadingFeed(false);
       }
     };
     loadLiveFeed();
@@ -325,6 +327,12 @@ export const DailyMarketRecommendationsCard: React.FC<DailyMarketRecommendationP
 
       {/* Content Grid */}
       {activeTabMode === 'NEWS' ? (
+        isLoadingFeed && liveNewsFeed.length === 0 ? (
+          <div className="pt-6 pb-4 text-center text-xs text-slate-400 flex items-center justify-center gap-2">
+            <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
+            <span>{isHe ? 'טוען חדשות יומיות חיות...' : "Loading today's live news..."}</span>
+          </div>
+        ) : (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 pt-4">
           {liveNewsFeed.slice(0, 3).map((item) => {
             const stockMatch = stocks.find((s) => s.ticker === item.ticker);
@@ -456,6 +464,7 @@ export const DailyMarketRecommendationsCard: React.FC<DailyMarketRecommendationP
             );
           })}
         </div>
+        )
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 pt-4">
           {filteredPicks.map((pick) => {

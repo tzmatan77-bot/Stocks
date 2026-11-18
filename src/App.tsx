@@ -3,7 +3,7 @@ import { ResearchStock, UniverseAnalysisResult, PortfolioPosition, WatchlistItem
 import { FULL_UNIVERSE_RESULT, TOP_20_SUMMARY_LIST } from './data/universeData';
 import { FULL_TOP_20_COMPOUNDERS } from './data/extendedUniverse';
 import { MARKET_UNIVERSE_CATALOG } from './data/marketUniverseData';
-import { getOfficialTop30Stocks, getOfficialTop20Stocks, getResearchStock, setLivePriceInRegistry } from './data/researchStockGenerator';
+import { getOfficialTop30Stocks, getOfficialTop20Stocks, getResearchStock, registerResearchedStock, setLivePriceInRegistry } from './data/researchStockGenerator';
 import { localizeStock } from './data/stockLocalization';
 import { PremiumHomeLanding } from './components/PremiumHomeLanding';
 import { Top20Table } from './components/Top20Table';
@@ -543,6 +543,7 @@ export default function App() {
       if (res.ok && contentType.includes('application/json')) {
         const data = await res.json();
         if (data.stock) {
+          registerResearchedStock(data.stock);
           resolvedStock = localizeStock(data.stock, currentLang);
         }
       }
