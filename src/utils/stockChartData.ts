@@ -51,13 +51,14 @@ export function generateStockChartSeries(
   baseCurrentPrice: number,
   timeframe: TimeframeOption,
   cagrEstimate: number = 15.0,
-  liveTickPrice?: number
+  liveTickPrice?: number,
+  liveChangePercent?: number
 ): ChartSeriesResult {
   const finalCurrentPrice = liveTickPrice !== undefined && liveTickPrice > 0 ? liveTickPrice : baseCurrentPrice;
   const rand = seedRandom(`${ticker}-${timeframe}-v2`);
   const data: ChartDataPoint[] = [];
 
-  const now = new Date(2026, 7, 29, 15, 30, 0); // 2026-08-29
+  const now = new Date();
   let count = 60;
   let annualizedReturn = (cagrEstimate || 15) / 100;
   let volatility = 0.22; // annual volatility
@@ -92,7 +93,7 @@ export function generateStockChartSeries(
       durationYears = 0.5;
       break;
     case 'YTD':
-      count = 45; // ~8 months of 2026
+      count = 45; // ~8 months of current year
       durationYears = 8 / 12;
       break;
     case '1Y':
@@ -110,11 +111,14 @@ export function generateStockChartSeries(
   }
 
   // Calculate realistic cumulative return for this period
-  // For 1D, daily noise between -2.5% and +3.5%
+  // For 1D, always anchor to real liveChangePercent if supplied so direction (+/-) matches live quote
   let expectedTotalDrift = 0;
   if (timeframe === '1D') {
-    const dailyDrift = (rand() * 4.2 - 1.8) / 100; // -1.8% to +2.4%
-    expectedTotalDrift = dailyDrift;
+    if (typeof liveChangePercent === 'number' && !isNaN(liveChangePercent) && isFinite(liveChangePercent)) {
+      expectedTotalDrift = Math.max(-0.95, liveChangePercent / 100);
+    } else {
+      expectedTotalDrift = 0;
+    }
   } else if (timeframe === '5D') {
     expectedTotalDrift = (rand() * 6.0 - 2.5) / 100;
   } else if (timeframe === '1M') {

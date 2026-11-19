@@ -50,6 +50,7 @@ export const DcfValuationCalculator: React.FC<DcfValuationCalculatorProps> = ({
   );
   const [searchInput, setSearchInput] = useState('');
   const [isSearching, setIsSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [showCustomOverrides, setShowCustomOverrides] = useState(false);
   const [customFcfOverride, setCustomFcfOverride] = useState<number | null>(null);
   const [customSharesOverride, setCustomSharesOverride] = useState<number | null>(null);
@@ -143,10 +144,11 @@ export const DcfValuationCalculator: React.FC<DcfValuationCalculatorProps> = ({
     const clean = resolveTickerSymbol(searchInput);
     if (!clean) return;
     setIsSearching(true);
+    setSearchError(null);
     try {
       let resolved = stocks.find((s) => s.ticker === clean);
+      let notFound = false;
       if (!resolved) {
-        // Fetch or dynamically generate
         try {
           const res = await fetch('/api/analyze-ticker', {
             method: 'POST',
@@ -154,15 +156,17 @@ export const DcfValuationCalculator: React.FC<DcfValuationCalculatorProps> = ({
             body: JSON.stringify({ ticker: clean, language: currentLang }),
           });
           const contentType = res.headers.get('content-type') || '';
-          if (res.ok && contentType.includes('application/json')) {
-            const data = await res.json();
-            if (data.stock) {
-              resolved = localizeStock(data.stock, currentLang);
-            }
+          const data = contentType.includes('application/json') ? await res.json().catch(() => null) : null;
+          if (res.status === 404) {
+            notFound = true;
+            setSearchError(data?.error || (isHe ? `הסימול ${clean} לא נמצא בבורסה או ב-SEC.` : `Ticker ${clean} not found.`));
+          } else if (res.ok && data?.stock) {
+            resolved = localizeStock(data.stock, currentLang);
           }
-        } catch (err) {
-          // ignore
+        } catch {
+          // ignore network error and fallback
         }
+        if (notFound) return;
         if (!resolved) {
           resolved = getResearchStock(clean);
         }
@@ -372,6 +376,11 @@ export const DcfValuationCalculator: React.FC<DcfValuationCalculatorProps> = ({
             </div>
           </div>
         </div>
+        {searchError && (
+          <div className="text-xs font-mono text-rose-300 bg-rose-950/60 border border-rose-800 rounded-lg px-3 py-2">
+            {searchError}
+          </div>
+        )}
 
         {/* Popular Ticker Quick Chips */}
         <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t border-slate-800/80">

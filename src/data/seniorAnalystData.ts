@@ -712,8 +712,8 @@ export function generateDynamicSeniorAnalystReports(
   const reports: SeniorAnalystReport[] = [];
   const firmsToUse = INSTITUTIONAL_FIRMS.slice(0, 9);
 
-  // Variance multipliers to create a natural, credible Wall Street distribution (High bull to conservative)
-  const multipliers = [1.14, 1.08, 1.04, 1.02, 0.99, 0.96, 1.12, 1.05, 0.92];
+  // Variance multipliers strictly mean-centered at 1.000x so firm average equals Wall St consensus
+  const multipliers = [1.14, 1.08, 1.03, 1.01, 1.00, 0.97, 0.96, 0.93, 0.88];
 
   firmsToUse.forEach((firmInfo, idx) => {
     const mult = multipliers[idx % multipliers.length];
@@ -805,14 +805,16 @@ export function getSeniorAnalystData(
   if (!rawReports || rawReports.length === 0) {
     rawReports = generateDynamicSeniorAnalystReports(stock, currentPrice);
   } else {
-    // If live price has moved significantly past a 2025 curated Buy-consensus target anchor,
-    // keep each analyst's relative target spread and rating upside consistent with today's price
+    // Align curated 2025 targets whenever live Nasdaq Wall St consensus or current price has materially shifted (>8% divergence)
     const rawMeanTarget = rawReports.reduce((sum, r) => sum + r.priceTarget, 0) / rawReports.length;
+    const parsedAvgTarget = parseFloat((stock.analysts?.averagePriceTarget?.value || '').replace(/[^0-9.]/g, ''));
+    const hasNasdaqConsensus = Boolean(stock.analysts?.averagePriceTarget?.source?.includes('Nasdaq') && !isNaN(parsedAvgTarget) && parsedAvgTarget > 0);
+    const divergedFromNasdaq = hasNasdaqConsensus && Math.abs(parsedAvgTarget - rawMeanTarget) / Math.max(1, rawMeanTarget) > 0.08;
     const buyMajority = rawReports.filter((r) => r.rating !== 'Neutral' && r.rating !== 'Hold' && r.rating !== 'Sell' && r.rating !== 'Underweight').length >= rawReports.length * 0.6;
-    if (buyMajority && currentPrice > rawMeanTarget * 1.04) {
-      const parsedAvgTarget = parseFloat((stock.analysts?.averagePriceTarget?.value || '').replace(/[^0-9.]/g, ''));
+
+    if (divergedFromNasdaq || (buyMajority && currentPrice > rawMeanTarget * 1.04)) {
       const anchorTarget =
-        !isNaN(parsedAvgTarget) && parsedAvgTarget > currentPrice * 1.05
+        !isNaN(parsedAvgTarget) && parsedAvgTarget > 0 && (hasNasdaqConsensus || parsedAvgTarget > currentPrice * 1.05)
           ? parsedAvgTarget
           : currentPrice * 1.18;
       const ratio = anchorTarget / Math.max(1, rawMeanTarget);

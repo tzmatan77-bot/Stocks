@@ -123,7 +123,7 @@ export const PortfolioPerformanceChart: React.FC<PortfolioPerformanceChartProps>
       rawTimestamp?: number;
     }> = [];
 
-    const now = new Date(2026, 7, 31, 16, 0, 0); // 2026-08-31 16:00
+    const now = new Date();
     const finalPortfolioValue = totalValue;
 
     // ─────────────────────────────────────────────────────────────

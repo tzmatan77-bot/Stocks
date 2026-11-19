@@ -151,11 +151,22 @@ export const PortfolioSimulator: React.FC<PortfolioSimulatorProps> = ({
         </div>
 
         <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 shadow text-center">
-          <div className="text-[10px] text-slate-400">Initial Capital</div>
-          <div className="text-lg font-bold text-white mt-1">
-            ${initialCapital.toLocaleString()}
-          </div>
-          <div className="text-[10px] text-slate-500 mt-0.5">Customizable Base</div>
+          <label htmlFor="sim-initial-capital" className="text-[10px] text-slate-400 block">
+            Initial Capital ($)
+          </label>
+          <input
+            id="sim-initial-capital"
+            type="number"
+            min="100"
+            step="1000"
+            value={initialCapital}
+            onChange={(e) => {
+              const v = parseFloat(e.target.value);
+              setInitialCapital(isNaN(v) ? 0 : Math.max(0, v));
+            }}
+            className="w-full text-center bg-slate-950 border border-slate-700 focus:border-cyan-500 rounded-lg px-2 py-1 text-base font-bold text-white mt-1 focus:outline-none"
+          />
+          <div className="text-[10px] text-slate-500 mt-1">Click to edit base ($)</div>
         </div>
 
         <div className="p-4 rounded-xl bg-slate-900 border border-cyan-800/80 shadow text-center">
@@ -238,16 +249,16 @@ export const PortfolioSimulator: React.FC<PortfolioSimulatorProps> = ({
           {/* Quick Add Pool */}
           <div className="pt-3 border-t border-slate-800/80">
             <span className="text-xs text-slate-400 font-mono block mb-2">
-              Add from TOP 10 Universe:
+              Add from Quality Compounder Universe ({stocks.length} stocks):
             </span>
             <div className="flex items-center gap-1.5 flex-wrap">
-              {top10.map((s) => {
+              {stocks.slice(0, 20).map((s) => {
                 const inPortfolio = allocations.some((a) => a.ticker === s.ticker);
                 return (
                   <button
                     key={s.ticker}
                     onClick={() => handleToggleStock(s.ticker)}
-                    className={`px-2.5 py-1 rounded text-xs font-mono transition ${
+                    className={`px-2.5 py-1 rounded text-xs font-mono transition cursor-pointer ${
                       inPortfolio
                         ? 'bg-cyan-950 text-cyan-300 border border-cyan-800'
                         : 'bg-slate-800 text-slate-400 hover:text-slate-200'

@@ -41,8 +41,8 @@ const INITIAL_WATCHLIST: WatchlistItem[] = [
     ticker: 'UNH',
     companyName: 'UnitedHealth Group Incorporated',
     addedAt: '2026-08-01',
-    targetBuyPrice: 495.0,
-    targetPE: 19.5,
+    targetBuyPrice: 315.0,
+    targetPE: 18.0,
     alertOnThesisBreak: true,
     notes: 'Leader in healthcare & Optum care delivery; buy on any Medicare Advantage rate noise.'
   },
@@ -50,7 +50,7 @@ const INITIAL_WATCHLIST: WatchlistItem[] = [
     ticker: 'MSFT',
     companyName: 'Microsoft Corporation',
     addedAt: '2026-08-05',
-    targetBuyPrice: 420.0,
+    targetBuyPrice: 430.0,
     targetPE: 30.0,
     alertOnThesisBreak: true,
     notes: 'Secular cloud and enterprise AI dominance with high switching costs.'
@@ -59,7 +59,7 @@ const INITIAL_WATCHLIST: WatchlistItem[] = [
     ticker: 'GOOGL',
     companyName: 'Alphabet Inc.',
     addedAt: '2026-08-10',
-    targetBuyPrice: 175.0,
+    targetBuyPrice: 255.0,
     targetPE: 22.0,
     alertOnThesisBreak: true,
     notes: 'Search monopoly cash engine funding GCP and Waymo autonomous growth.'
@@ -68,7 +68,7 @@ const INITIAL_WATCHLIST: WatchlistItem[] = [
     ticker: 'V',
     companyName: 'Visa Inc.',
     addedAt: '2026-08-12',
-    targetBuyPrice: 280.0,
+    targetBuyPrice: 305.0,
     targetPE: 26.0,
     alertOnThesisBreak: true,
     notes: 'Global payment rail tollbooth; capital-light compounder.'
@@ -77,7 +77,7 @@ const INITIAL_WATCHLIST: WatchlistItem[] = [
     ticker: 'COST',
     companyName: 'Costco Wholesale Corporation',
     addedAt: '2026-08-15',
-    targetBuyPrice: 850.0,
+    targetBuyPrice: 960.0,
     targetPE: 45.0,
     alertOnThesisBreak: true,
     notes: 'Subscription moat & 93% membership renewal rate; prime retail fortress.'
@@ -100,12 +100,12 @@ export default function App() {
       const saved = localStorage.getItem('MY_PERSONAL_HOLDINGS_V1') || localStorage.getItem('INSTITUTIONAL_PORTFOLIO_DATA_V1');
       if (saved !== null) {
         const parsed = JSON.parse(saved);
-        return Array.isArray(parsed) ? parsed.length : 4;
+        return Array.isArray(parsed) ? parsed.length : 9;
       }
     } catch (e) {
       // ignore
     }
-    return 4;
+    return 9;
   });
 
   const [isMobileNavOpen, setIsMobileNavOpen] = useState<boolean>(false);
@@ -245,14 +245,6 @@ export default function App() {
         source: 'initial_model'
       };
     });
-    initial['BKNG'] = {
-      price: 186.00,
-      changePercent: 0,
-      changeAmount: 0,
-      previousClose: 186.00,
-      timestamp: Date.now(),
-      source: 'initial_model'
-    };
     return initial;
   });
 
@@ -341,7 +333,7 @@ export default function App() {
 
       // 5. Common market compounders & frequently monitored mega-caps
       const commonMegaCaps = [
-        'MCD', 'COST', 'NVDA', 'AAPL', 'MSFT', 'UNH', 'GOOGL', 'V', 'MA',
+        'MCD', 'COST', 'NVDA', 'AAPL', 'MSFT', 'UNH', 'GOOGL', 'GOOG', 'V', 'MA',
         'AMZN', 'META', 'TSLA', 'LLY', 'AVGO', 'TXN', 'SPGI', 'ISRG',
         'KO', 'PEP', 'PG', 'WMT', 'HD', 'JPM', 'BLK', 'BRK.B', 'MNST',
         'CVS', 'ELV', 'CI', 'HUM', 'BSX', 'NVMI'
@@ -392,13 +384,20 @@ export default function App() {
               setLivePriceInRegistry(ticker, quote.price, quote.previousClose, quote.changePercent);
 
               const current = next[ticker.toUpperCase()];
-              if (!current || current.price !== quote.price) {
+              const nextChgPct = typeof quote.changePercent === 'number' ? quote.changePercent : 0;
+              if (
+                !current ||
+                current.price !== quote.price ||
+                current.changePercent !== nextChgPct ||
+                current.previousClose !== (quote.previousClose || quote.price) ||
+                current.source !== (quote.source || 'market_api')
+              ) {
                 changed = true;
                 next[ticker.toUpperCase()] = {
                   price: quote.price,
                   previousClose: quote.previousClose || quote.price,
                   changeAmount: quote.changeAmount || 0,
-                  changePercent: typeof quote.changePercent === 'number' ? quote.changePercent : 0,
+                  changePercent: nextChgPct,
                   timestamp: quote.timestamp || Date.now(),
                   source: quote.source || 'market_api'
                 };
@@ -528,11 +527,15 @@ export default function App() {
     }
   }, [fetchLiveQuotes]);
 
+  const [searchAlert, setSearchAlert] = useState<string | null>(null);
+
   const handleSearchTicker = async (ticker: string) => {
     const cleanTicker = ticker.toUpperCase().trim();
     if (!cleanTicker) return;
     setIsSearching(true);
+    setSearchAlert(null);
     let resolvedStock: ResearchStock | null = null;
+    let notFoundMsg: string | null = null;
     try {
       const res = await fetch('/api/analyze-ticker', {
         method: 'POST',
@@ -540,12 +543,12 @@ export default function App() {
         body: JSON.stringify({ ticker: cleanTicker, language: currentLang }),
       });
       const contentType = res.headers.get('content-type') || '';
-      if (res.ok && contentType.includes('application/json')) {
-        const data = await res.json();
-        if (data.stock) {
-          registerResearchedStock(data.stock);
-          resolvedStock = localizeStock(data.stock, currentLang);
-        }
+      const data = contentType.includes('application/json') ? await res.json().catch(() => null) : null;
+      if (res.status === 404) {
+        notFoundMsg = data?.error || (currentLang === 'he' ? `הסימול "${cleanTicker}" לא נמצא בבורסה או ב-SEC.` : `Ticker "${cleanTicker}" not found.`);
+      } else if (res.ok && data?.stock) {
+        registerResearchedStock(data.stock);
+        resolvedStock = localizeStock(data.stock, currentLang);
       }
     } catch (e) {
       console.warn('Network request to /api/analyze-ticker failed, using local model:', e);
@@ -553,8 +556,14 @@ export default function App() {
       setIsSearching(false);
     }
 
+    if (notFoundMsg) {
+      setSearchAlert(notFoundMsg);
+      setTimeout(() => setSearchAlert(null), 5000);
+      return;
+    }
+
     if (!resolvedStock) {
-      // Robust client-side fallback
+      // Robust client-side fallback only on network outage
       const generated = getResearchStock(cleanTicker);
       resolvedStock = localizeStock(generated, currentLang);
     }
@@ -728,10 +737,13 @@ export default function App() {
     try {
       const saved = localStorage.getItem('MY_PERSONAL_HOLDINGS_V1') || localStorage.getItem('INSTITUTIONAL_PORTFOLIO_DATA_V1');
       let currentPositions: PortfolioPosition[] = [];
-      if (saved) {
-        currentPositions = JSON.parse(saved);
+      if (saved !== null) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          currentPositions = parsed;
+        }
       }
-      const existingIdx = currentPositions.findIndex((p) => p.ticker === stock.ticker);
+      const existingIdx = currentPositions.findIndex((p) => p.ticker.toUpperCase() === stock.ticker.toUpperCase());
       if (existingIdx >= 0) {
         const existing = currentPositions[existingIdx];
         const newShares = existing.shares + shares;
@@ -745,21 +757,29 @@ export default function App() {
           notes: notes || existing.notes
         };
       } else {
+        const todayDate = new Date().toISOString().slice(0, 10);
         const newPos: PortfolioPosition = {
           id: `pos-${Date.now()}-${stock.ticker}`,
-          ticker: stock.ticker,
+          ticker: stock.ticker.toUpperCase(),
           companyName: stock.companyName,
           shares: shares,
           buyPrice: buyPrice,
           actionFee: actionFee,
-          buyDate: new Date().toISOString().slice(0, 10),
+          purchaseDate: todayDate,
           notes: notes || `Direct allocation. Quality Score: ${stock.investmentScore}/100.`
         };
         currentPositions.push(newPos);
       }
+      const updatedAt = Date.now();
       const serialized = JSON.stringify(currentPositions);
       localStorage.setItem('MY_PERSONAL_HOLDINGS_V1', serialized);
       localStorage.setItem('INSTITUTIONAL_PORTFOLIO_DATA_V1', serialized);
+      localStorage.setItem('MY_PERSONAL_HOLDINGS_UPDATED_AT_V1', String(updatedAt));
+      fetch('/api/user-portfolio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ positions: currentPositions, updatedAt }),
+      }).catch(() => {});
       window.dispatchEvent(new Event('portfolio-updated'));
       setPortfolioPositionsCount(currentPositions.length);
       setActiveTab('portfolio');
@@ -874,6 +894,13 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {searchAlert && (
+          <div className="max-w-3xl mx-auto mt-3 px-4 py-2.5 rounded-xl bg-rose-950/90 border border-rose-700 text-rose-200 text-xs font-mono flex items-center justify-between gap-3">
+            <span>{searchAlert}</span>
+            <button onClick={() => setSearchAlert(null)} className="text-rose-400 hover:text-white cursor-pointer">×</button>
+          </div>
+        )}
 
         {/* Flagship Home Landing Page */}
         {activeTab === 'home' && (

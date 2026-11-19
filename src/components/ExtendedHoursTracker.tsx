@@ -478,10 +478,11 @@ export const ExtendedHoursTracker: React.FC<ExtendedHoursTrackerProps> = ({
             </div>
           ) : (
             items.map((item, idx) => {
-              const snap = item.activeSession || getSessionSnapshot(item);
+              const snap = getSessionSnapshot(item) || item.activeSession;
               if (!snap) return null;
               const pct = snap.changePercent;
               const amt = snap.changeAmount;
+              const showRegularNow = item.currentSessionState === 'REGULAR_MARKET' && typeof item.regularPrice === 'number';
               const inWatch = isInActiveWatchlist(item.ticker);
               const inPort = portfolioTickers.includes(item.ticker.toUpperCase());
               const isPinned = pinnedTickers.includes(item.ticker.toUpperCase());
@@ -541,6 +542,15 @@ export const ExtendedHoursTracker: React.FC<ExtendedHoursTrackerProps> = ({
                           {formatTradeTime(snap.lastTradeTime, isHe)}
                         </span>
                       </div>
+                      {showRegularNow && (
+                        <div className="text-[10px] mt-0.5 text-slate-400 flex items-center justify-end gap-1">
+                          <span>{isHe ? 'מסחר רציף כעת:' : 'Regular Now:'}</span>
+                          <span className="text-slate-200 font-semibold">${item.regularPrice.toFixed(2)}</span>
+                          <span className={item.regularChangePercent >= 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>
+                            ({item.regularChangePercent >= 0 ? '+' : ''}{item.regularChangePercent.toFixed(2)}%)
+                          </span>
+                        </div>
+                      )}
                     </div>
 
                     <div
@@ -710,6 +720,17 @@ export const ExtendedHoursTracker: React.FC<ExtendedHoursTrackerProps> = ({
           </button>
         </div>
       </section>
+
+      {moversData?.currentMarketState === 'REGULAR_MARKET' && (
+        <div className="p-3.5 rounded-xl bg-amber-950/35 border border-amber-500/30 text-amber-200 text-xs flex items-start gap-2.5">
+          <Info className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+          <span>
+            {isHe
+              ? `המסחר הרציף בוול סטריט פתוח כרגע (${moversData.nyTimeStr} NY) — רשימת ${isPre ? 'הטרום-מסחר' : 'לאחר הסגירה'} מציגה את תנועות הסשן המורחב (04:00–09:30 NY), ולצד כל מניה מופיע גם מחיר המסחר הרגיל החי ברגע זה למניעת בלבול בין עלייה בבוקר לירידה במהלך היום.`
+              : `US Regular Market is currently open (${moversData.nyTimeStr} NY) — lists show the extended session snapshot alongside the live regular-session price so intraday reversals are clearly visible.`}
+          </span>
+        </div>
+      )}
 
       {/* 2. SEARCH ANY STOCK LIVE IN EXTENDED HOURS */}
       <section className="bg-slate-900/70 border border-slate-800 rounded-xl p-4 sm:p-5 space-y-4">

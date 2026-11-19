@@ -49,7 +49,7 @@ const TIMEFRAMES: { id: TimeframeOption; labelEn: string; labelHe: string; descE
   { id: '5D', labelEn: '5D', labelHe: '5 ימים', descEn: 'Past 5 days', descHe: '5 ימים אחרונים' },
   { id: '1M', labelEn: '1M', labelHe: '1 חודש', descEn: 'Past month', descHe: 'חודש אחרון' },
   { id: '6M', labelEn: '6M', labelHe: '6 חודשים', descEn: 'Past 6 months', descHe: '6 חודשים אחרונים' },
-  { id: 'YTD', labelEn: 'YTD', labelHe: 'מתחילת שנה', descEn: 'Year to date', descHe: 'מתחילת שנת 2026' },
+  { id: 'YTD', labelEn: 'YTD', labelHe: 'מתחילת שנה', descEn: 'Year to date', descHe: 'מתחילת השנה' },
   { id: '1Y', labelEn: '1Y', labelHe: '1 שנה', descEn: 'Past year', descHe: 'שנה אחרונה' },
   { id: '5Y', labelEn: '5Y', labelHe: '5 שנים', descEn: 'Past 5 years', descHe: '5 שנים אחרונות' },
   { id: 'MAX', labelEn: 'MAX', labelHe: 'מקסימום', descEn: 'All time', descHe: 'כל הזמנים' },
@@ -76,8 +76,42 @@ export const StockLiveChart: React.FC<StockLiveChartProps> = ({
   const [showSMA200, setShowSMA200] = useState(false);
   const [showVolume, setShowVolume] = useState(false);
   const [benchmarkOverlay, setBenchmarkOverlay] = useState<'none' | 'SPY' | 'QQQ'>('none');
+  const [serverChart, setServerChart] = useState<any | null>(null);
+  const [isLoadingChart, setIsLoadingChart] = useState(false);
 
   const isHe = currentLang === 'he';
+
+  // Fetch real OHLCV historical bars from Yahoo Finance backend proxy
+  useEffect(() => {
+    const controller = new AbortController();
+    let active = true;
+    setIsLoadingChart(true);
+
+    fetch(
+      `/api/stock-chart/${encodeURIComponent(ticker)}?timeframe=${encodeURIComponent(selectedTimeframe)}&benchmark=${encodeURIComponent(benchmarkOverlay)}`,
+      { signal: controller.signal, headers: { Accept: 'application/json' } }
+    )
+      .then((res) => (res.ok ? res.json() : null))
+      .then((json) => {
+        if (!active) return;
+        if (json && Array.isArray(json.data) && json.data.length > 1) {
+          setServerChart(json);
+        } else {
+          setServerChart(null);
+        }
+      })
+      .catch(() => {
+        if (active) setServerChart(null);
+      })
+      .finally(() => {
+        if (active) setIsLoadingChart(false);
+      });
+
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [ticker, selectedTimeframe, benchmarkOverlay]);
 
   // Parse numeric price
   const numericPrice = useMemo(() => {
@@ -86,7 +120,7 @@ export const StockLiveChart: React.FC<StockLiveChartProps> = ({
     return !isNaN(parsed) && parsed > 0 ? parsed : 100;
   }, [currentPrice]);
 
-  // Parse CAGR for realistic 5-year trajectory
+  // Parse CAGR for fallback model trajectory
   const numericCagr = useMemo(() => {
     if (!expected5YCAGR) return 15.0;
     const match = expected5YCAGR.match(/([0-9.]+)/);
@@ -102,31 +136,44 @@ export const StockLiveChart: React.FC<StockLiveChartProps> = ({
     }
   }, [liveTickPrice]);
 
-  // Base chart series
-  const rawChartSeries = useMemo(() => {
+  // Prefer verified real Yahoo Finance chart bars; fall back gracefully to generated series anchored to liveChangePercent
+  const fallbackSeries = useMemo(() => {
     return generateStockChartSeries(
       ticker,
       numericPrice,
       selectedTimeframe,
       numericCagr,
-      liveTickPrice
+      liveTickPrice,
+      liveChangePercent
     );
-  }, [ticker, numericPrice, selectedTimeframe, numericCagr, liveTickPrice]);
+  }, [ticker, numericPrice, selectedTimeframe, numericCagr, liveTickPrice, liveChangePercent]);
+
+  const isRealChartData = Boolean(
+    serverChart &&
+      serverChart.ticker === ticker.toUpperCase() &&
+      serverChart.timeframe === selectedTimeframe &&
+      Array.isArray(serverChart.data) &&
+      serverChart.data.length > 1
+  );
+
+  const rawChartSeries = useMemo(() => {
+    if (isRealChartData && serverChart) {
+      return serverChart;
+    }
+    return fallbackSeries;
+  }, [isRealChartData, serverChart, fallbackSeries]);
 
   // Enrich with Indicators (SMA 50, SMA 200, Benchmark SPY/QQQ, Multiples)
   const enrichedData = useMemo(() => {
-    const data = rawChartSeries.data;
+    const data: ChartDataPoint[] = rawChartSeries.data || [];
     const count = data.length;
-    
-    // Benchmark drift rate
+
+    // Fallback benchmark drift only when server benchmark curve wasn't provided
     const spyReturn = selectedTimeframe === '1D' ? 0.35 : selectedTimeframe === 'YTD' ? 11.2 : 12.8;
     const qqqReturn = selectedTimeframe === '1D' ? 0.62 : selectedTimeframe === 'YTD' ? 14.5 : 17.5;
-    
-    // Base PE for this stock
     const basePE = ticker === 'NVDA' ? 38 : ticker === 'MSFT' ? 32 : ticker === 'UNH' ? 20 : ticker === 'COST' ? 48 : 24;
 
-    return data.map((pt, idx) => {
-      // Calculate rolling averages
+    return data.map((pt: any, idx: number) => {
       const window50 = Math.min(idx + 1, 10);
       const slice50 = data.slice(Math.max(0, idx - window50 + 1), idx + 1);
       const sma50Val = slice50.reduce((acc, curr) => acc + curr.price, 0) / slice50.length;
@@ -135,13 +182,14 @@ export const StockLiveChart: React.FC<StockLiveChartProps> = ({
       const slice200 = data.slice(Math.max(0, idx - window200 + 1), idx + 1);
       const sma200Val = slice200.reduce((acc, curr) => acc + curr.price, 0) / slice200.length;
 
-      // Benchmark normalized price line
       const progress = idx / (count - 1 || 1);
-      const spyNormalized = Number((rawChartSeries.startPrice * (1 + (spyReturn / 100) * progress)).toFixed(2));
-      const qqqNormalized = Number((rawChartSeries.startPrice * (1 + (qqqReturn / 100) * progress)).toFixed(2));
+      const spyFallback = Number((rawChartSeries.startPrice * (1 + (spyReturn / 100) * progress)).toFixed(2));
+      const qqqFallback = Number((rawChartSeries.startPrice * (1 + (qqqReturn / 100) * progress)).toFixed(2));
 
-      // Historical PE simulation
-      const peRatio = Number((basePE * (pt.price / (rawChartSeries.startPrice || 1)) * (0.95 + (Math.sin(idx * 0.4) * 0.05))).toFixed(1));
+      const spyNormalized = benchmarkOverlay === 'SPY' && typeof pt.benchmarkNormalized === 'number' ? pt.benchmarkNormalized : spyFallback;
+      const qqqNormalized = benchmarkOverlay === 'QQQ' && typeof pt.benchmarkNormalized === 'number' ? pt.benchmarkNormalized : qqqFallback;
+
+      const peRatio = Number((basePE * (pt.price / (rawChartSeries.startPrice || 1))).toFixed(1));
       const evFcfRatio = Number((peRatio * 0.88).toFixed(1));
 
       return {
@@ -155,20 +203,38 @@ export const StockLiveChart: React.FC<StockLiveChartProps> = ({
         medianPE: basePE,
       };
     });
-  }, [rawChartSeries, selectedTimeframe, ticker]);
+  }, [rawChartSeries, selectedTimeframe, ticker, benchmarkOverlay]);
 
-  // Active display point (either hovered scrub point or current final point)
-  const activePoint = hoveredPoint || enrichedData[enrichedData.length - 1];
+  // Active display point (either hovered scrub point or latest synced point)
+  const activePoint = hoveredPoint || null;
 
-  // Active display calculations
-  const displayPrice = activePoint ? activePoint.price : rawChartSeries.currentPrice;
-  const displayChangeAmount = activePoint
-    ? activePoint.changeFromStart
-    : rawChartSeries.totalChangeAmount;
+  // Synchronize 1D header metrics cleanly with liveTickPrice & liveChangePercent when not scrubbing
+  const hasLive1DOverride =
+    selectedTimeframe === '1D' &&
+    !activePoint &&
+    typeof liveTickPrice === 'number' &&
+    !isNaN(liveTickPrice) &&
+    liveTickPrice > 0;
+
+  const displayPrice = activePoint
+    ? activePoint.price
+    : hasLive1DOverride
+    ? liveTickPrice!
+    : rawChartSeries.currentPrice;
+
   const displayChangePercent = activePoint
     ? activePoint.changePctFromStart
+    : selectedTimeframe === '1D' && typeof liveChangePercent === 'number' && !isNaN(liveChangePercent)
+    ? liveChangePercent
     : rawChartSeries.totalChangePercent;
-  const isDisplayPositive = displayChangeAmount >= 0;
+
+  const displayChangeAmount = activePoint
+    ? activePoint.changeFromStart
+    : hasLive1DOverride
+    ? Number((liveTickPrice! - (rawChartSeries.startPrice > 0 ? rawChartSeries.startPrice : liveTickPrice! / Math.max(0.05, 1 + (displayChangePercent || 0) / 100))).toFixed(2))
+    : rawChartSeries.totalChangeAmount;
+
+  const isDisplayPositive = displayChangePercent > 0 || (displayChangePercent === 0 && displayChangeAmount >= 0);
 
   const currentTfObj = TIMEFRAMES.find((t) => t.id === selectedTimeframe) || TIMEFRAMES[0];
   const timeframeDesc = isHe ? currentTfObj.descHe : currentTfObj.descEn;
@@ -219,9 +285,17 @@ export const StockLiveChart: React.FC<StockLiveChartProps> = ({
                 {companyName}
               </span>
             )}
-            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold bg-emerald-950/80 text-emerald-400 border border-emerald-800/60">
-              <span className={`w-1.5 h-1.5 rounded-full bg-emerald-400 ${tickFlash ? 'scale-150 ring-2 ring-emerald-300' : 'animate-pulse'}`} />
-              {isHe ? 'שוק חי בלייב' : 'LIVE MARKET'}
+            <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono font-semibold border ${
+              isRealChartData
+                ? 'bg-emerald-950/80 text-emerald-400 border-emerald-800/60'
+                : 'bg-slate-900 text-slate-400 border-slate-700'
+            }`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${isRealChartData ? 'bg-emerald-400' : 'bg-amber-400'} ${tickFlash ? 'scale-150 ring-2 ring-emerald-300' : isLoadingChart ? 'animate-ping' : 'animate-pulse'}`} />
+              {isLoadingChart
+                ? (isHe ? 'טוען נתוני שוק...' : 'LOADING BAR DATA...')
+                : isRealChartData
+                ? (isHe ? 'גרף שוק אמיתי (Yahoo Finance)' : 'YAHOO FINANCE LIVE')
+                : (isHe ? 'הערכת מודל' : 'MODEL ESTIMATE')}
             </span>
           </div>
 

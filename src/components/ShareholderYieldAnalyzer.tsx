@@ -33,21 +33,30 @@ export const ShareholderYieldAnalyzer: React.FC<ShareholderYieldAnalyzerProps> =
 
   // Extract shareholder metrics for all stocks
   const enrichedStocks = useMemo(() => {
-    return stocks.map((s) => {
-      const localized = localizeStock(s, currentLang);
-      const divStr = (s.perShare || s.perShareValueCreation)?.dividendYield || '1.2%';
-      const buybackStr = (s.perShare || s.perShareValueCreation)?.buybackYield || '2.5%';
-      const divCagrStr = (s.perShare || s.perShareValueCreation)?.dividendCAGR5Y || '8.5%';
-      const sharesReducedStr = (s.perShare || s.perShareValueCreation)?.sharesOutstandingChange5Y || '-5.2%';
+    const parsePctSafe = (raw: string | undefined, fallback: number): number => {
+      if (!raw) return fallback;
+      const cleaned = raw.replace(/[^0-9.-]/g, '');
+      const num = parseFloat(cleaned);
+      return isNaN(num) ? fallback : Math.max(0, num);
+    };
 
-      const divNum = parseFloat(divStr.replace(/[^0-9.]/g, '')) || 0.8;
-      const buybackNum = parseFloat(buybackStr.replace(/[^0-9.]/g, '')) || 1.8;
+    return stocks.filter(Boolean).map((s) => {
+      const localized = localizeStock(s, currentLang);
+      const perShareObj = s.perShare || s.perShareValueCreation;
+      const divStr = perShareObj?.dividendYield;
+      const buybackStr = perShareObj?.buybackYield;
+      const divCagrStr = perShareObj?.dividendCAGR5Y;
+      const sharesReducedStr = perShareObj?.sharesOutstandingChange5Y || '0.0%';
+
+      const divNum = parsePctSafe(divStr, 0);
+      const buybackNum = parsePctSafe(buybackStr, 0);
       const totalYieldNum = Number((divNum + buybackNum).toFixed(2));
-      const divCagrNum = parseFloat(divCagrStr.replace(/[^0-9.]/g, '')) || 7.0;
+      const divCagrNum = parsePctSafe(divCagrStr, 0);
 
       // Calculate FCF payout sustainability
-      const fcfMarginNum = parseFloat(s.financialQuality?.fcfMargin?.value.replace(/[^0-9.]/g, '') || '20');
-      const safetyScore = Math.min(99, Math.round(75 + fcfMarginNum * 0.6 + (s.financialQualityScore * 0.15)));
+      const fcfMarginRaw = parseFloat((s.financialQuality?.fcfMargin?.value || '').replace(/[^0-9.-]/g, ''));
+      const fcfMarginNum = isNaN(fcfMarginRaw) ? 18 : fcfMarginRaw;
+      const safetyScore = Math.min(99, Math.max(35, Math.round(72 + fcfMarginNum * 0.55 + ((s.financialQualityScore || 75) * 0.15))));
 
       return {
         ...localized,
@@ -81,8 +90,22 @@ export const ShareholderYieldAnalyzer: React.FC<ShareholderYieldAnalyzerProps> =
     return ['ALL', ...Array.from(new Set(valid.map((s) => s?.sector).filter(Boolean)))];
   }, [stocks]);
 
-  // Top Yield Leader
+  // Top Yield Leader & Computed Averages
   const topYieldStock = filteredAndSorted[0];
+  const universeStats = useMemo(() => {
+    const list = filteredAndSorted.length > 0 ? filteredAndSorted : enrichedStocks;
+    const n = list.length || 1;
+    const avgDiv = list.reduce((acc, s) => acc + s.divNum, 0) / n;
+    const avgBuyback = list.reduce((acc, s) => acc + s.buybackNum, 0) / n;
+    const avgTotal = avgDiv + avgBuyback;
+    const avgSafety = Math.round(list.reduce((acc, s) => acc + s.safetyScore, 0) / n);
+    return {
+      avgDiv: avgDiv.toFixed(2),
+      avgBuyback: avgBuyback.toFixed(2),
+      avgTotal: avgTotal.toFixed(2),
+      avgSafety,
+    };
+  }, [filteredAndSorted, enrichedStocks]);
 
   return (
     <div className="space-y-6">
@@ -144,12 +167,12 @@ export const ShareholderYieldAnalyzer: React.FC<ShareholderYieldAnalyzerProps> =
           <div className="flex items-center gap-3">
             <StockLogoBadge ticker={topYieldStock?.ticker || 'UNH'} name={topYieldStock?.companyName || ''} size="md" />
             <div>
-              <div className="text-lg font-bold font-mono text-amber-300">{topYieldStock?.ticker}</div>
-              <div className="text-xs text-slate-400">{topYieldStock?.companyName}</div>
+              <div className="text-lg font-bold font-mono text-amber-300">{topYieldStock?.ticker || '—'}</div>
+              <div className="text-xs text-slate-400">{topYieldStock?.companyName || ''}</div>
             </div>
           </div>
           <div className="text-2xl font-extrabold font-mono text-white mt-1">
-            {topYieldStock?.totalYieldNum}% <span className="text-xs text-slate-400 font-normal">{isHe ? 'תשואה שנתית' : 'Total Yield'}</span>
+            {topYieldStock?.totalYieldNum ?? 0}% <span className="text-xs text-slate-400 font-normal">{isHe ? 'תשואה שנתית' : 'Total Yield'}</span>
           </div>
         </div>
 
@@ -159,10 +182,12 @@ export const ShareholderYieldAnalyzer: React.FC<ShareholderYieldAnalyzerProps> =
             <Percent className="w-4 h-4 text-cyan-400" />
           </div>
           <div className="text-2xl font-extrabold font-mono text-cyan-300 mt-2">
-            3.85%
+            {universeStats.avgTotal}%
           </div>
           <p className="text-xs text-slate-400">
-            {isHe ? 'מורכב מ-1.4% דיבידנד + 2.45% רכישה עצמית ממוצעת' : '1.40% Dividend + 2.45% Net Share Buybacks'}
+            {isHe
+              ? `מורכב מ-${universeStats.avgDiv}% דיבידנד + ${universeStats.avgBuyback}% רכישה עצמית ממוצעת`
+              : `${universeStats.avgDiv}% Dividend + ${universeStats.avgBuyback}% Net Share Buybacks`}
           </p>
         </div>
 
@@ -172,10 +197,10 @@ export const ShareholderYieldAnalyzer: React.FC<ShareholderYieldAnalyzerProps> =
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
           </div>
           <div className="text-2xl font-extrabold font-mono text-emerald-300 mt-2">
-            96 / 100
+            {universeStats.avgSafety} / 100
           </div>
           <p className="text-xs text-slate-400">
-            {isHe ? 'אפס סיכון קיצוץ דיבידנד – תזרימי FCF חזקים פי 3–8 מהחלוקה' : 'Zero dividend cut risk across quality compounders'}
+            {isHe ? 'ציון כיסוי ממוצע של תזרים המזומנים החופשי לחלוקת דיבידנד ורכישות' : 'Weighted Free Cash Flow coverage across displayed compounders'}
           </p>
         </div>
       </div>

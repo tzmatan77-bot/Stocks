@@ -60,6 +60,7 @@ export const InvestmentMemoPrinter: React.FC<InvestmentMemoPrinterProps> = ({
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
   const [searchInput, setSearchInput] = useState('');
   const [isSearching, setIsSearching] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
 
   useEffect(() => {
     if (selectedStock?.ticker && selectedStock.ticker !== selectedTicker) {
@@ -97,14 +98,35 @@ export const InvestmentMemoPrinter: React.FC<InvestmentMemoPrinterProps> = ({
     const clean = searchInput.toUpperCase().trim();
     if (!clean) return;
     setIsSearching(true);
+    setSearchError(null);
     try {
       let resolved = stocks.find((s) => s.ticker === clean);
       if (!resolved) {
-        resolved = getResearchStock(clean);
+        const res = await fetch('/api/analyze-ticker', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({ ticker: clean, language: currentLang }),
+        });
+        const contentType = res.headers.get('content-type') || '';
+        const data = contentType.includes('application/json') ? await res.json().catch(() => null) : null;
+        if (res.status === 404) {
+          setSearchError(data?.error || (isHe ? `הסימול ${clean} לא נמצא בבורסה או ב-SEC.` : `Ticker ${clean} not found.`));
+          return;
+        }
+        if (res.ok && data?.stock) {
+          resolved = localizeStock(data.stock, currentLang);
+        } else {
+          resolved = getResearchStock(clean);
+        }
         if (onAddStockToUniverse && resolved) {
           onAddStockToUniverse(resolved);
         }
       }
+      setSelectedTicker(clean);
+      setSearchInput('');
+    } catch {
+      const generated = getResearchStock(clean);
+      if (onAddStockToUniverse && generated) onAddStockToUniverse(generated);
       setSelectedTicker(clean);
       setSearchInput('');
     } finally {
@@ -210,6 +232,11 @@ export const InvestmentMemoPrinter: React.FC<InvestmentMemoPrinterProps> = ({
                 {isSearching ? <RefreshCw className="w-3 h-3 animate-spin" /> : isHe ? 'חפש' : 'Go'}
               </button>
             </form>
+            {searchError && (
+              <div className="w-full text-xs font-mono text-rose-300 bg-rose-950/60 border border-rose-800 rounded-lg px-3 py-1.5">
+                {searchError}
+              </div>
+            )}
 
             {/* Select Stock Dropdown */}
             <select

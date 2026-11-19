@@ -110,11 +110,19 @@ export const MacroStressTester: React.FC<MacroStressTesterProps> = ({
   const stressResults = useMemo(() => {
     return stocks.filter(Boolean).map((rawStock) => {
       const s = localizeStock(rawStock, currentLang);
-      const debtToEbitda = parseFloat(s.financialQuality?.netDebtToEBITDA?.value.replace(/[^0-9.-]/g, '') || '1.0');
+      const rawDebtStr = s.financialQuality?.netDebtToEBITDA?.value || '';
+      const parsedDebt = parseFloat(rawDebtStr.replace(/[^0-9.-]/g, ''));
+      const debtToEbitda = rawDebtStr.toLowerCase().includes('net cash')
+        ? -0.5
+        : !isNaN(parsedDebt)
+        ? parsedDebt
+        : 0.5;
       const pricingPower = s.moat?.pricingPower?.level || 'High';
-      const grossMargin = parseFloat(s.financialQuality?.grossMargin?.value.replace(/[^0-9.]/g, '') || '50');
-      const isHealthcareOrDefense = s.sector === 'Healthcare' || s.industry?.includes('Aerospace');
-      const isTech = s.sector === 'Technology';
+      const parsedGM = parseFloat((s.financialQuality?.grossMargin?.value || '').replace(/[^0-9.-]/g, ''));
+      const grossMargin = !isNaN(parsedGM) ? parsedGM : 50;
+      const isHealthcareOrDefense =
+        s.sector === 'Health Care' || s.sector === 'Healthcare' || s.industry?.includes('Aerospace');
+      const isTech = s.sector === 'Information Technology' || s.sector === 'Technology';
 
       // 1. Rate Impact (Balance sheet net debt + PE compression)
       let rateImpact = -(effectiveRateBps / 100) * (debtToEbitda > 1.5 ? 4.5 : 2.0);

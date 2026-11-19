@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { ResearchStock, PortfolioPosition, RealizedTransaction, PortfolioTranche } from '../types';
 import { StockLogoBadge } from './StockLogoBadge';
 import { PortfolioPerformanceChart, PortfolioChartHolding } from './PortfolioPerformanceChart';
@@ -67,6 +67,7 @@ interface PersonalPortfolioTrackerProps {
 }
 
 const STORAGE_KEY = 'MY_PERSONAL_HOLDINGS_V1';
+const PORTFOLIO_UPDATED_AT_KEY = 'MY_PERSONAL_HOLDINGS_UPDATED_AT_V1';
 const REALIZED_STORAGE_KEY = 'MY_REALIZED_TRANSACTIONS_V1';
 
 // מחיר פעולה קבוע לפעולה (לא למניה) - מעודכן מהיום ל-7 דולר קדימה (עסקאות היסטוריות נשמרות לפי 7.50)
@@ -186,22 +187,32 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
     }
   };
 
-  // Load persisted holdings
+  const normalizePosition = (p: any): PortfolioPosition => ({
+    ...p,
+    ticker: String(p.ticker || '').toUpperCase().trim(),
+    purchaseDate: p.purchaseDate || p.buyDate || new Date().toISOString().slice(0, 10),
+  });
+
+  const serverSyncCompletedRef = useRef(false);
+  const skipNextPersistStampRef = useRef(false);
+  const backupFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Load persisted holdings (respect explicit empty [] saved by user; only seed DEFAULT_PORTFOLIO if never saved)
   const [positions, setPositions] = useState<PortfolioPosition[]>(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('INSTITUTIONAL_PORTFOLIO_DATA_V1');
       if (saved !== null) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          // Filter out dummy starter positions pos-1 (BSX) and pos-2 (UNH)
-          const cleaned = parsed.filter(
-            (p) => !(p.ticker === 'BSX' && p.id === 'pos-1') && !(p.ticker === 'UNH' && p.id === 'pos-2')
-          );
+        if (Array.isArray(parsed)) {
+          const cleaned = parsed
+            .filter((p) => !(p.ticker === 'BSX' && p.id === 'pos-1') && !(p.ticker === 'UNH' && p.id === 'pos-2'))
+            .map(normalizePosition);
           if (cleaned.length !== parsed.length) {
             localStorage.setItem(STORAGE_KEY, JSON.stringify(cleaned));
+            localStorage.setItem(PORTFOLIO_UPDATED_AT_KEY, String(Date.now()));
             window.dispatchEvent(new Event('portfolio-updated'));
           }
-          return cleaned.length > 0 ? cleaned : DEFAULT_PORTFOLIO;
+          return cleaned;
         }
       }
     } catch (e) {
@@ -210,7 +221,7 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
     return DEFAULT_PORTFOLIO;
   });
 
-  // Re-sync with localStorage if changed externally (e.g. from modal or other tab)
+  // Re-sync with localStorage if changed externally (e.g. from modal in App.tsx or other tab)
   useEffect(() => {
     const handleSync = () => {
       try {
@@ -218,7 +229,14 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
         if (saved !== null) {
           const parsed = JSON.parse(saved);
           if (Array.isArray(parsed)) {
-            setPositions(parsed);
+            const normalized = parsed.map(normalizePosition);
+            setPositions((prev) => {
+              const prevJson = JSON.stringify(prev);
+              const nextJson = JSON.stringify(normalized);
+              if (prevJson === nextJson) return prev;
+              skipNextPersistStampRef.current = true;
+              return normalized;
+            });
           }
         }
       } catch (e) {}
@@ -230,26 +248,6 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
       window.removeEventListener('storage', handleSync);
       window.removeEventListener('portfolio-updated', handleSync);
     };
-  }, []);
-
-  // Sync to server on first load
-  useEffect(() => {
-    fetch('/api/user-portfolio', { headers: { Accept: 'application/json' } })
-      .then((res) => (res.ok && res.headers.get('content-type')?.includes('application/json') ? res.json() : null))
-      .then((data) => {
-        if (data && Array.isArray(data.positions) && data.positions.length > 0) {
-          // If server has custom positions, sync them
-          setPositions(data.positions);
-        } else if (positions && positions.length > 0) {
-          // Send current client positions to server
-          fetch('/api/user-portfolio', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ positions }),
-          }).catch(() => {});
-        }
-      })
-      .catch(() => {});
   }, []);
 
   // Realized Transactions State (מימושים שבוצעו)
@@ -316,12 +314,52 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
     ];
   });
 
-  // Save Realized Transactions to localStorage
+  // Timestamp-safe initial sync with server (NEVER overwrite newer browser edits when Render wakes up)
   useEffect(() => {
-    try {
-      localStorage.setItem(REALIZED_STORAGE_KEY, JSON.stringify(realizedTransactions));
-    } catch (e) {}
-  }, [realizedTransactions]);
+    let active = true;
+    const localUpdatedAt = Number(localStorage.getItem(PORTFOLIO_UPDATED_AT_KEY) || '0');
+    const hasLocalSaved = localStorage.getItem(STORAGE_KEY) !== null || localStorage.getItem('INSTITUTIONAL_PORTFOLIO_DATA_V1') !== null;
+
+    fetch('/api/user-portfolio', { headers: { Accept: 'application/json' } })
+      .then((res) => (res.ok && res.headers.get('content-type')?.includes('application/json') ? res.json() : null))
+      .then((data) => {
+        if (!active) return;
+        const serverUpdatedAt = typeof data?.updatedAt === 'number' ? data.updatedAt : 0;
+        const serverPositions = Array.isArray(data?.positions) ? data.positions.map(normalizePosition) : [];
+        const serverShouldWin =
+          (serverUpdatedAt > 0 && serverUpdatedAt > localUpdatedAt) ||
+          (!hasLocalSaved && localUpdatedAt === 0 && serverPositions.length > 0);
+
+        if (serverShouldWin) {
+          skipNextPersistStampRef.current = true;
+          const nextUpdatedAt = serverUpdatedAt > 0 ? serverUpdatedAt : Date.now();
+          localStorage.setItem(PORTFOLIO_UPDATED_AT_KEY, String(nextUpdatedAt));
+          setPositions(serverPositions);
+          if (Array.isArray(data?.realizedTransactions)) {
+            setRealizedTransactions(data.realizedTransactions);
+          }
+        } else {
+          // Push current browser holdings up to server without mutating local state
+          const pushUpdatedAt = localUpdatedAt > 0 ? localUpdatedAt : Date.now();
+          if (localUpdatedAt === 0 && hasLocalSaved) {
+            localStorage.setItem(PORTFOLIO_UPDATED_AT_KEY, String(pushUpdatedAt));
+          }
+          fetch('/api/user-portfolio', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ positions, realizedTransactions, updatedAt: pushUpdatedAt }),
+          }).catch(() => {});
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) serverSyncCompletedRef.current = true;
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Memoize tickers string to avoid spurious re-triggers
   const tickersKey = useMemo(() => {
@@ -404,6 +442,8 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
 
   // REALIZED TRADES JOURNAL MODAL (יומן מימושים)
   const [showRealizedLogModal, setShowRealizedLogModal] = useState<boolean>(false);
+  const [confirmingDeleteTxId, setConfirmingDeleteTxId] = useState<string | null>(null);
+  const [confirmingClearRealized, setConfirmingClearRealized] = useState<boolean>(false);
 
   // Portfolio Primary View Tab: 'active' (פוזיציות פתוחות בתיק), 'realized' (טבלת מימושים שנתית), 'both' (הצג את שתיהן יחד)
   const [portfolioViewTab, setPortfolioViewTab] = useState<'active' | 'realized' | 'both'>('both');
@@ -556,21 +596,91 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
     }
   };
 
-  // Persist positions to localStorage and sync to server
+  // Persist positions & realized transactions reliably to localStorage + sync to server
+  const isFirstRenderRef = useRef(true);
   useEffect(() => {
     try {
       const json = JSON.stringify(positions);
       localStorage.setItem(STORAGE_KEY, json);
       localStorage.setItem('INSTITUTIONAL_PORTFOLIO_DATA_V1', json);
+      localStorage.setItem(REALIZED_STORAGE_KEY, JSON.stringify(realizedTransactions));
+
+      if (isFirstRenderRef.current) {
+        isFirstRenderRef.current = false;
+        return;
+      }
+
+      if (skipNextPersistStampRef.current) {
+        skipNextPersistStampRef.current = false;
+        window.dispatchEvent(new Event('portfolio-updated'));
+        return;
+      }
+
+      const nowTs = Date.now();
+      localStorage.setItem(PORTFOLIO_UPDATED_AT_KEY, String(nowTs));
+      window.dispatchEvent(new Event('portfolio-updated'));
+
       fetch('/api/user-portfolio', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ positions }),
+        body: JSON.stringify({ positions, realizedTransactions, updatedAt: nowTs }),
       }).catch(() => {});
     } catch (e) {
       console.warn('Failed to save portfolio to local storage', e);
     }
-  }, [positions]);
+  }, [positions, realizedTransactions]);
+
+  // One-click full JSON backup export / import (safe across devices & Render container sleeps)
+  const handleExportPortfolioBackup = () => {
+    try {
+      const payload = {
+        app: 'MoatGuard',
+        exportedAt: new Date().toISOString(),
+        updatedAt: Number(localStorage.getItem(PORTFOLIO_UPDATED_AT_KEY) || Date.now()),
+        positions,
+        realizedTransactions,
+      };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `moatguard_portfolio_backup_${new Date().toISOString().slice(0, 10)}.json`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      showToast(isHe ? '✅ גיבוי התיק המלא (JSON) הורד למכשיר בהצלחה!' : 'Portfolio JSON backup downloaded!', 'success');
+    } catch (e) {
+      showToast(isHe ? 'שגיאה בייצוא הגיבוי.' : 'Backup export failed.', 'warning');
+    }
+  };
+
+  const handleImportPortfolioBackup = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const importedPositions = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.positions) ? parsed.positions : null;
+      if (!importedPositions) {
+        showToast(isHe ? 'קובץ גיבוי לא תקין (לא נמצאו פוזיציות).' : 'Invalid backup file format.', 'warning');
+        return;
+      }
+      setPositions(importedPositions.map(normalizePosition));
+      if (Array.isArray(parsed?.realizedTransactions)) {
+        setRealizedTransactions(parsed.realizedTransactions);
+      }
+      showToast(
+        isHe
+          ? `✅ שוחזרו בהצלחה ${importedPositions.length} מניות מהגיבוי ונשמרו במכשיר ובשרת!`
+          : `Restored ${importedPositions.length} holdings from backup!`,
+        'success'
+      );
+    } catch {
+      showToast(isHe ? 'שגיאה בקריאת קובץ הגיבוי JSON.' : 'Failed to parse JSON backup file.', 'warning');
+    }
+  };
 
   // Combined stock lookup universe for catalog selection
   const allCatalogStocks = useMemo(() => {
@@ -933,40 +1043,6 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
     setSellingPosition(null);
   };
 
-  // Quick 1-click add BSX if user does not have it in holdings
-  const handleAddBsxQuick = () => {
-    const bsxPos: PortfolioPosition = {
-      id: `pos-${Date.now()}-BSX`,
-      ticker: 'BSX',
-      companyName: 'Boston Scientific Corporation',
-      shares: 45,
-      buyPrice: 86.50,
-      actionFee: ACTION_FEE_USD,
-      purchaseDate: '2026-06-12',
-      notes: 'צנתרי אלקטרופיזיולוגיה PFA (נבדקת השפעת מתקפת הסייבר)',
-    };
-    setPositions((prev) => [bsxPos, ...prev]);
-    if (onRegisterTickers) onRegisterTickers(['BSX']);
-    showToast(isHe ? '✅ מניית בוסטון סיינטיפיק (BSX) נוספה לתיק עם אזהרת הסייבר הפעילה!' : 'Added BSX to portfolio with active risk alert!', 'success');
-  };
-
-  // Quick 1-click add CVS if user does not have it in holdings
-  const handleAddCvsQuick = () => {
-    const cvsPos: PortfolioPosition = {
-      id: `pos-${Date.now()}-CVS`,
-      ticker: 'CVS',
-      companyName: 'CVS Health Corporation',
-      shares: 60,
-      buyPrice: 73.20,
-      actionFee: ACTION_FEE_USD,
-      purchaseDate: '2026-07-15',
-      notes: 'אזהרת WSJ: שחיקת מרווחי Caremark ו-340B עד 2027',
-    };
-    setPositions((prev) => [cvsPos, ...prev]);
-    if (onRegisterTickers) onRegisterTickers(['CVS']);
-    showToast(isHe ? '✅ מניית CVS Health נוספה לתיק עם אזהרת WSJ 2027 הפעילה!' : 'Added CVS to portfolio with active WSJ 2027 risk alert!', 'success');
-  };
-
   // Holding Risk & Catalyst Alert evaluator
   const getHoldingAlert = (pos: { ticker: string; companyName?: string; dailyChangePct: number; currentPrice: number; buyPrice: number; matchedStock?: any }) => {
     const ticker = pos.ticker.toUpperCase().trim();
@@ -1242,9 +1318,12 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
   };
 
   const handleDeleteRealizedTx = (id: string) => {
-    if (window.confirm(isHe ? 'האם למחוק שורת מימוש זו מטבלת המימושים?' : 'Delete this realized transaction record?')) {
+    if (confirmingDeleteTxId === id) {
       setRealizedTransactions((prev) => prev.filter((t) => t.id !== id));
+      setConfirmingDeleteTxId(null);
       showToast(isHe ? 'שורת המימוש נמחקה בהצלחה.' : 'Realized record deleted.', 'info');
+    } else {
+      setConfirmingDeleteTxId(id);
     }
   };
 
@@ -1448,6 +1527,32 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
               </button>
             )}
 
+            <input
+              ref={backupFileInputRef}
+              type="file"
+              accept="application/json,.json"
+              onChange={handleImportPortfolioBackup}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={handleExportPortfolioBackup}
+              className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-mono text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shrink-0"
+              title={isHe ? 'הורד קובץ גיבוי של התיק (JSON) לשמירה או העברה למחשב אחר' : 'Download full portfolio JSON backup'}
+            >
+              <Download className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden xl:inline">{isHe ? 'גיבוי תיק' : 'Backup'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => backupFileInputRef.current?.click()}
+              className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-mono text-xs rounded-xl transition flex items-center gap-1.5 cursor-pointer shrink-0"
+              title={isHe ? 'טען קובץ גיבוי JSON קיים של התיק' : 'Restore portfolio from JSON backup'}
+            >
+              <Upload className="w-3.5 h-3.5 text-cyan-400" />
+              <span className="hidden xl:inline">{isHe ? 'שחזר גיבוי' : 'Restore'}</span>
+            </button>
+
             <button
               onClick={handleOpenAddModal}
               className="px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold rounded-xl text-xs font-mono transition flex items-center gap-2 shadow-md cursor-pointer shrink-0"
@@ -1464,9 +1569,6 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
         const alertedHoldings = calculatedPositions
           .map((p) => ({ pos: p, alert: getHoldingAlert(p) }))
           .filter((item): item is { pos: typeof item.pos; alert: NonNullable<typeof item.alert> } => Boolean(item.alert));
-
-        const hasBsxInPortfolio = calculatedPositions.some((p) => p.ticker.toUpperCase() === 'BSX');
-        const hasCvsInPortfolio = calculatedPositions.some((p) => p.ticker.toUpperCase() === 'CVS');
 
         return (
           <div className="space-y-3">
@@ -1601,24 +1703,16 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
                   </span>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 shrink-0">
-                  {!hasCvsInPortfolio && (
-                    <button
-                      onClick={handleAddCvsQuick}
-                      className="px-3 py-1.5 bg-rose-950/60 hover:bg-rose-900/60 text-rose-300 border border-rose-700/50 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
-                      <span>{isHe ? '+ הוסף את CVS Health (אזהרת WSJ 2027)' : '+ Add CVS (WSJ 2027 Alert)'}</span>
-                    </button>
-                  )}
-                  {!hasBsxInPortfolio && (
-                    <button
-                      onClick={handleAddBsxQuick}
-                      className="px-3 py-1.5 bg-rose-950/60 hover:bg-rose-900/60 text-rose-300 border border-rose-700/50 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <AlertTriangle className="w-3.5 h-3.5 text-rose-400" />
-                      <span>{isHe ? '+ הוסף את בוסטון סיינטיפיק (BSX)' : '+ Add BSX to portfolio'}</span>
-                    </button>
-                  )}
+                  <button
+                    onClick={() => {
+                      const event = new CustomEvent('navigate-tab', { detail: 'premarket' });
+                      window.dispatchEvent(event);
+                    }}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 rounded-xl text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Zap className="w-3.5 h-3.5 text-cyan-400" />
+                    <span>{isHe ? 'פתח פיד חדשות יומיות' : 'Open Daily News Feed'}</span>
+                  </button>
                 </div>
               </div>
             )}
@@ -2887,13 +2981,33 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
 
                         {/* Actions */}
                         <td className="py-3 px-3 text-center">
-                          <button
-                            onClick={() => handleDeleteRealizedTx(tx.id)}
-                            className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-950 text-slate-500 hover:text-rose-400 transition cursor-pointer"
-                            title={isHe ? 'מחק רשומת מימוש זו' : 'Delete trade record'}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          {confirmingDeleteTxId === tx.id ? (
+                            <div className="flex items-center justify-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteRealizedTx(tx.id)}
+                                className="px-2 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-bold cursor-pointer"
+                              >
+                                {isHe ? 'מחק' : 'Yes'}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmingDeleteTxId(null)}
+                                className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] cursor-pointer"
+                              >
+                                {isHe ? 'בטל' : 'No'}
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteRealizedTx(tx.id)}
+                              className="p-1.5 rounded-lg bg-slate-800 hover:bg-rose-950 text-slate-500 hover:text-rose-400 transition cursor-pointer"
+                              title={isHe ? 'מחק רשומת מימוש זו' : 'Delete trade record'}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                         </td>
                       </tr>
                     );
@@ -2915,18 +3029,38 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
             </div>
 
             {realizedTransactions.length > 0 && (
-              <button
-                onClick={() => {
-                  if (window.confirm(isHe ? 'האם אתה בטוח שברצונך לאפס את כל היסטוריית המימושים בתיק?' : 'Clear all realized trade history?')) {
-                    setRealizedTransactions([]);
-                    showToast(isHe ? 'יומן המימושים אופס.' : 'Realized trades cleared.', 'info');
-                  }
-                }}
-                className="text-slate-500 hover:text-rose-400 transition cursor-pointer text-[11px] font-sans hover:underline flex items-center gap-1"
-              >
-                <Trash2 className="w-3 h-3" />
-                <span>{isHe ? 'איפוס כל יומן המימושים' : 'Clear realized log'}</span>
-              </button>
+              confirmingClearRealized ? (
+                <div className="flex items-center gap-2">
+                  <span className="text-[11px] text-rose-300 font-sans">{isHe ? 'לאפס את כל היומן?' : 'Clear all?'}</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setRealizedTransactions([]);
+                      setConfirmingClearRealized(false);
+                      showToast(isHe ? 'יומן המימושים אופס.' : 'Realized trades cleared.', 'info');
+                    }}
+                    className="px-2 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white text-[11px] font-bold cursor-pointer font-sans"
+                  >
+                    {isHe ? 'כן, אפס' : 'Confirm'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmingClearRealized(false)}
+                    className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px] cursor-pointer font-sans"
+                  >
+                    {isHe ? 'ביטול' : 'Cancel'}
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmingClearRealized(true)}
+                  className="text-slate-500 hover:text-rose-400 transition cursor-pointer text-[11px] font-sans hover:underline flex items-center gap-1"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>{isHe ? 'איפוס כל יומן המימושים' : 'Clear realized log'}</span>
+                </button>
+              )
             )}
           </div>
         </div>
@@ -3930,18 +4064,37 @@ export const PersonalPortfolioTracker: React.FC<PersonalPortfolioTrackerProps> =
 
             <div className="flex justify-between items-center pt-2">
               {realizedTransactions.length > 0 && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (window.confirm(isHe ? 'האם אתה בטוח שברצונך לנקות את היסטוריית המימושים?' : 'Clear realized transaction history?')) {
-                      setRealizedTransactions([]);
-                      showToast(isHe ? 'היסטוריית המימושים נוקתה.' : 'Realized trade history cleared.', 'info');
-                    }
-                  }}
-                  className="text-xs text-rose-400 hover:underline cursor-pointer"
-                >
-                  {isHe ? 'נקה היסטוריית מימושים' : 'Clear history'}
-                </button>
+                confirmingClearRealized ? (
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-rose-300">{isHe ? 'לנקות את כל היסטוריית המימושים?' : 'Clear all?'}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRealizedTransactions([]);
+                        setConfirmingClearRealized(false);
+                        showToast(isHe ? 'היסטוריית המימושים נוקתה.' : 'Realized trade history cleared.', 'info');
+                      }}
+                      className="px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold cursor-pointer"
+                    >
+                      {isHe ? 'כן, נקה' : 'Confirm'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmingClearRealized(false)}
+                      className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs cursor-pointer"
+                    >
+                      {isHe ? 'ביטול' : 'Cancel'}
+                    </button>
+                  </div>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => setConfirmingClearRealized(true)}
+                    className="text-xs text-rose-400 hover:underline cursor-pointer"
+                  >
+                    {isHe ? 'נקה היסטוריית מימושים' : 'Clear history'}
+                  </button>
+                )
               )}
               <button
                 type="button"

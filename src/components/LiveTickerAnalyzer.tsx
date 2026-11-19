@@ -69,6 +69,7 @@ export const LiveTickerAnalyzer: React.FC<LiveTickerAnalyzerProps> = ({
     setLoading(true);
     setErrorMsg(null);
     let resolvedStock: ResearchStock | null = null;
+    let notFoundMsg: string | null = null;
     try {
       const response = await fetch('/api/analyze-ticker', {
         method: 'POST',
@@ -77,19 +78,25 @@ export const LiveTickerAnalyzer: React.FC<LiveTickerAnalyzerProps> = ({
       });
 
       const contentType = response.headers.get('content-type') || '';
-      if (response.ok && contentType.includes('application/json')) {
-        const data = await response.json().catch(() => null);
-        if (data?.stock) {
-          resolvedStock = data.stock;
-          registerResearchedStock(data.stock);
-        }
+      const data = contentType.includes('application/json') ? await response.json().catch(() => null) : null;
+      if (response.status === 404) {
+        notFoundMsg = data?.error || (isHe ? `הסימול "${target}" לא נמצא בבורסות ארה״ב או במאגר ה-SEC.` : `Ticker "${target}" was not found on US exchanges or SEC EDGAR.`);
+      } else if (response.ok && data?.stock) {
+        resolvedStock = data.stock;
+        registerResearchedStock(data.stock);
       }
     } catch (err: any) {
       console.warn('LiveTickerAnalyzer fetch failed, falling back to local dataset:', err);
     }
 
+    if (notFoundMsg) {
+      setErrorMsg(notFoundMsg);
+      setLoading(false);
+      return;
+    }
+
     if (!resolvedStock) {
-      // Local institutional generator fallback
+      // Local institutional generator fallback (only on network error)
       const generated = getResearchStock(target);
       resolvedStock = generated;
     }

@@ -196,7 +196,13 @@ Institutional Research Desk | MoatGuard`;
 export function openWhatsAppShare(data: StockShareData) {
   const text = generateWhatsAppShareText(data);
   const whatsappUrl = `https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`;
-  window.open(whatsappUrl, '_blank', 'noopener,noreferrer');
+  const a = document.createElement('a');
+  a.href = whatsappUrl;
+  a.target = '_blank';
+  a.rel = 'noopener noreferrer';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 
 export function openEmailShare(data: StockShareData) {

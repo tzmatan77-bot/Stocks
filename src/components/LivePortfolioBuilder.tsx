@@ -26,7 +26,7 @@ interface LivePortfolioBuilderProps {
   onOpenCompare?: (stockA: ResearchStock, stockB: ResearchStock) => void;
 }
 
-const STORAGE_KEY = 'INSTITUTIONAL_PORTFOLIO_DATA_V1';
+const STORAGE_KEY = 'LIVE_PORTFOLIO_BUILDER_V2';
 
 const DEFAULT_POSITIONS: PortfolioPosition[] = [
   {

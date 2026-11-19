@@ -308,26 +308,54 @@ app.get('/api/health', (_req, res) => {
 
 const USER_PORTFOLIO_FILE = path.join(process.cwd(), 'user-portfolio.json');
 
-app.get('/api/user-portfolio', (req, res) => {
+app.get('/api/user-portfolio', (_req, res) => {
   try {
     if (fs.existsSync(USER_PORTFOLIO_FILE)) {
       const data = fs.readFileSync(USER_PORTFOLIO_FILE, 'utf-8');
       const parsed = JSON.parse(data);
-      res.json({ positions: Array.isArray(parsed) ? parsed : [] });
-      return;
+      if (Array.isArray(parsed)) {
+        // Legacy Git-seeded array snapshot: updatedAt = 0 ensures it never overwrites newer user browser edits
+        res.json({ positions: parsed, realizedTransactions: null, updatedAt: 0, isSeedSnapshot: true });
+        return;
+      }
+      if (parsed && typeof parsed === 'object') {
+        res.json({
+          positions: Array.isArray(parsed.positions) ? parsed.positions : [],
+          realizedTransactions: Array.isArray(parsed.realizedTransactions) ? parsed.realizedTransactions : null,
+          updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
+          isSeedSnapshot: false,
+        });
+        return;
+      }
     }
   } catch (e) {
     console.error('Failed to read user-portfolio.json', e);
   }
-  res.json({ positions: [] });
+  res.json({ positions: [], realizedTransactions: null, updatedAt: 0, isSeedSnapshot: true });
 });
 
 app.post('/api/user-portfolio', (req, res) => {
   try {
-    const { positions } = req.body || {};
+    const { positions, realizedTransactions, updatedAt } = req.body || {};
     if (Array.isArray(positions)) {
-      fs.writeFileSync(USER_PORTFOLIO_FILE, JSON.stringify(positions, null, 2), 'utf-8');
-      res.json({ success: true, count: positions.length });
+      let existingRealized: any = null;
+      try {
+        if (fs.existsSync(USER_PORTFOLIO_FILE)) {
+          const prev = JSON.parse(fs.readFileSync(USER_PORTFOLIO_FILE, 'utf-8'));
+          if (prev && !Array.isArray(prev) && Array.isArray(prev.realizedTransactions)) {
+            existingRealized = prev.realizedTransactions;
+          }
+        }
+      } catch {
+        // ignore read error
+      }
+      const nextPayload = {
+        positions,
+        realizedTransactions: Array.isArray(realizedTransactions) ? realizedTransactions : existingRealized,
+        updatedAt: typeof updatedAt === 'number' && updatedAt > 0 ? updatedAt : Date.now(),
+      };
+      fs.writeFileSync(USER_PORTFOLIO_FILE, JSON.stringify(nextPayload, null, 2), 'utf-8');
+      res.json({ success: true, count: positions.length, updatedAt: nextPayload.updatedAt });
       return;
     }
     res.status(400).json({ error: 'positions must be an array' });
@@ -510,14 +538,49 @@ app.get('/api/quote/:ticker', async (req, res) => {
 
 app.get('/api/universe', (req, res) => {
   const enrichStock = (s: any) => {
+    const updated = { ...s };
     const cached = liveQuotesCache.get(s.ticker);
-    if (cached && cached.quote && typeof cached.quote.price === 'number') {
-      return {
-        ...s,
-        currentPrice: `$${cached.quote.price.toFixed(2)}`,
+    const cachedNasdaq = nasdaqSummaryCache.get(s.ticker)?.data;
+    const basePrice = parseFloat(String(s.currentPrice || '').replace(/[^0-9.]/g, ''));
+
+    if (cached && cached.quote && typeof cached.quote.price === 'number' && cached.quote.price > 0) {
+      const liveP = cached.quote.price;
+      updated.currentPrice = `$${liveP.toFixed(2)}`;
+      if (cachedNasdaq?.marketCapB && cachedNasdaq.marketCapB > 0) {
+        const capB = cachedNasdaq.marketCapB;
+        updated.marketCap = capB >= 1000 ? `$${(capB / 1000).toFixed(2)}T` : `$${capB.toFixed(1)}B`;
+      } else if (basePrice > 0 && s.marketCap) {
+        const m = String(s.marketCap).replace(/,/g, '').match(/([0-9.]+)\s*([TB])/i);
+        if (m) {
+          const baseCapB = parseFloat(m[1]) * (m[2].toUpperCase() === 'T' ? 1000 : 1);
+          const scaledCapB = baseCapB * (liveP / basePrice);
+          updated.marketCap = scaledCapB >= 1000 ? `$${(scaledCapB / 1000).toFixed(2)}T` : `$${scaledCapB.toFixed(1)}B`;
+        }
+      }
+    }
+
+    if (cachedNasdaq?.oneYrTarget && cachedNasdaq.oneYrTarget > 0 && updated.analysts?.averagePriceTarget) {
+      updated.analysts = {
+        ...updated.analysts,
+        averagePriceTarget: {
+          ...updated.analysts.averagePriceTarget,
+          value: `$${cachedNasdaq.oneYrTarget.toFixed(2)}`,
+          source: 'Nasdaq / Wall St Consensus',
+        },
       };
     }
-    return s;
+
+    const activeP = parseFloat(String(updated.currentPrice || '').replace(/[^0-9.]/g, ''));
+    const tgtP = parseFloat(String(updated.analysts?.averagePriceTarget?.value || '').replace(/[^0-9.]/g, ''));
+    if (activeP > 0 && tgtP > 0 && updated.analysts) {
+      const up = ((tgtP - activeP) / activeP) * 100;
+      updated.analysts = {
+        ...updated.analysts,
+        impliedAnalystUpside: `${up >= 0 ? '+' : ''}${up.toFixed(1)}%`,
+      };
+    }
+
+    return updated;
   };
 
   const enriched = {
@@ -1792,16 +1855,409 @@ app.all('/api/premarket-news/regenerate', async (req, res) => {
   }
 });
 
-// 2.5 GET /api/daily-earnings - Live-synced daily earnings calendar with real-time quotes
-app.get('/api/daily-earnings', async (req, res) => {
+// 2.4 GET /api/stock-chart/:ticker - Real Yahoo Finance OHLCV Chart Data + Normalized Benchmark
+const stockChartCache = new Map<string, { payload: any; expiresAt: number }>();
+
+const CHART_TIMEFRAME_MAP: Record<string, { range: string; interval: string; ttlMs: number }> = {
+  '1D': { range: '1d', interval: '5m', ttlMs: 60 * 1000 },
+  '5D': { range: '5d', interval: '30m', ttlMs: 3 * 60 * 1000 },
+  '1M': { range: '1mo', interval: '1d', ttlMs: 5 * 60 * 1000 },
+  '6M': { range: '6mo', interval: '1d', ttlMs: 10 * 60 * 1000 },
+  'YTD': { range: 'ytd', interval: '1d', ttlMs: 10 * 60 * 1000 },
+  '1Y': { range: '1y', interval: '1wk', ttlMs: 15 * 60 * 1000 },
+  '5Y': { range: '5y', interval: '1mo', ttlMs: 30 * 60 * 1000 },
+  'MAX': { range: 'max', interval: '1mo', ttlMs: 30 * 60 * 1000 },
+};
+
+async function fetchYahooChartSeries(financeTicker: string, range: string, interval: string) {
+  const chromeUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+  for (const host of hosts) {
+    try {
+      const url = `https://${host}/v8/finance/chart/${encodeURIComponent(financeTicker)}?range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}`;
+      const resp = await fetch(url, {
+        headers: { 'User-Agent': chromeUA, Accept: 'application/json' },
+        signal: AbortSignal.timeout(5500),
+      });
+      if (!resp.ok) continue;
+      const json: any = await resp.json();
+      const result = json?.chart?.result?.[0];
+      if (result && Array.isArray(result.timestamp) && result.timestamp.length > 0) {
+        return result;
+      }
+    } catch {
+      // try next host
+    }
+  }
+  return null;
+}
+
+app.get('/api/stock-chart/:ticker', async (req, res) => {
   try {
-    const rawEvents = getDailyEarningsData();
-    const eventTickers = Array.from(new Set(rawEvents.map((e) => e.ticker.toUpperCase().trim())));
+    const rawTicker = String(req.params.ticker || '').trim().toUpperCase();
+    const cleanTicker = SERVER_TICKER_ALIASES[rawTicker] || rawTicker;
+    const tfRaw = String(req.query.timeframe || '1M').toUpperCase().trim();
+    const timeframe = CHART_TIMEFRAME_MAP[tfRaw] ? tfRaw : '1M';
+    const benchmarkRaw = String(req.query.benchmark || 'none').toUpperCase().trim();
+    const benchmark = benchmarkRaw === 'SPY' || benchmarkRaw === 'QQQ' ? benchmarkRaw : 'none';
+
+    if (!cleanTicker) {
+      res.status(400).json({ error: 'Ticker is required' });
+      return;
+    }
+
+    const cacheKey = `${cleanTicker}:${timeframe}:${benchmark}`;
+    const cached = stockChartCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      res.json(cached.payload);
+      return;
+    }
+
+    const cfg = CHART_TIMEFRAME_MAP[timeframe];
+    const financeTicker = normalizeTickerForFinance(cleanTicker);
+    const [mainResult, benchResult] = await Promise.all([
+      fetchYahooChartSeries(financeTicker, cfg.range, cfg.interval),
+      benchmark !== 'none' ? fetchYahooChartSeries(benchmark, cfg.range, cfg.interval) : Promise.resolve(null),
+    ]);
+
+    if (!mainResult) {
+      res.status(404).json({ error: `No chart data available for ${cleanTicker}` });
+      return;
+    }
+
+    const meta = mainResult.meta || {};
+    const currencyCode = String(meta.currency || 'USD').toUpperCase();
+    const fx = FX_RATES_TO_USD[currencyCode] || 1.0;
+    const timestamps: number[] = mainResult.timestamp || [];
+    const quote = mainResult.indicators?.quote?.[0] || {};
+    const opens: any[] = quote.open || [];
+    const highs: any[] = quote.high || [];
+    const lows: any[] = quote.low || [];
+    const closes: any[] = quote.close || [];
+    const volumes: any[] = quote.volume || [];
+
+    const validBars: Array<{ ts: number; open: number; high: number; low: number; close: number; vol: number }> = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      const c = closes[i];
+      if (typeof c !== 'number' || !isFinite(c) || c <= 0) continue;
+      const o = typeof opens[i] === 'number' && isFinite(opens[i]) ? opens[i] : c;
+      const h = typeof highs[i] === 'number' && isFinite(highs[i]) ? highs[i] : Math.max(o, c);
+      const l = typeof lows[i] === 'number' && isFinite(lows[i]) ? lows[i] : Math.min(o, c);
+      const v = typeof volumes[i] === 'number' && isFinite(volumes[i]) ? volumes[i] : 0;
+      validBars.push({
+        ts: timestamps[i],
+        open: Number((o * fx).toFixed(2)),
+        high: Number((h * fx).toFixed(2)),
+        low: Number((l * fx).toFixed(2)),
+        close: Number((c * fx).toFixed(2)),
+        vol: Math.max(0, Math.round(v)),
+      });
+    }
+
+    if (validBars.length === 0) {
+      res.status(404).json({ error: `Empty price bars for ${cleanTicker}` });
+      return;
+    }
+
+    const rawPrevClose = typeof meta.chartPreviousClose === 'number' ? meta.chartPreviousClose * fx : validBars[0].close;
+    const startPrice = timeframe === '1D' && rawPrevClose > 0 ? Number(rawPrevClose.toFixed(2)) : validBars[0].close;
+
+    // Optional normalized benchmark mapping by timestamp
+    const benchClosesMap = new Map<number, number>();
+    let benchStartPrice = 0;
+    if (benchResult && Array.isArray(benchResult.timestamp)) {
+      const bCloses = benchResult.indicators?.quote?.[0]?.close || [];
+      for (let i = 0; i < benchResult.timestamp.length; i++) {
+        if (typeof bCloses[i] === 'number' && bCloses[i] > 0) {
+          if (!benchStartPrice) benchStartPrice = bCloses[i];
+          benchClosesMap.set(benchResult.timestamp[i], bCloses[i]);
+        }
+      }
+    }
+    const benchTimestamps = Array.from(benchClosesMap.keys()).sort((a, b) => a - b);
+
+    let highPrice = -Infinity;
+    let lowPrice = Infinity;
+    let totalVolume = 0;
+
+    const points = validBars.map((bar) => {
+      const dt = new Date(bar.ts * 1000);
+      let timeLabel = '';
+      let fullDate = '';
+      if (timeframe === '1D') {
+        timeLabel = dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+        fullDate = `${dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })} ${timeLabel}`;
+      } else if (timeframe === '5D') {
+        timeLabel = `${dt.toLocaleDateString('en-US', { weekday: 'short' })} ${dt.getHours().toString().padStart(2, '0')}:00`;
+        fullDate = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      } else if (timeframe === '1M' || timeframe === '6M' || timeframe === 'YTD') {
+        timeLabel = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        fullDate = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      } else {
+        timeLabel = dt.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+        fullDate = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+      }
+
+      if (bar.high > highPrice) highPrice = bar.high;
+      if (bar.low < lowPrice) lowPrice = bar.low;
+      totalVolume += bar.vol;
+
+      const changeFromStart = Number((bar.close - startPrice).toFixed(2));
+      const changePctFromStart = startPrice > 0 ? Number(((changeFromStart / startPrice) * 100).toFixed(2)) : 0;
+
+      let benchmarkNormalized: number | undefined;
+      if (benchStartPrice > 0 && benchTimestamps.length > 0) {
+        let closestTs = benchTimestamps[0];
+        let minDiff = Math.abs(bar.ts - closestTs);
+        for (const bt of benchTimestamps) {
+          const d = Math.abs(bar.ts - bt);
+          if (d < minDiff) {
+            minDiff = d;
+            closestTs = bt;
+          }
+        }
+        const bVal = benchClosesMap.get(closestTs);
+        if (bVal && benchStartPrice > 0) {
+          benchmarkNormalized = Number((startPrice * (bVal / benchStartPrice)).toFixed(2));
+        }
+      }
+
+      return {
+        timestamp: dt.toISOString(),
+        timeLabel,
+        fullDate,
+        price: bar.close,
+        open: bar.open,
+        high: bar.high,
+        low: bar.low,
+        close: bar.close,
+        volume: bar.vol,
+        changeFromStart,
+        changePctFromStart,
+        ...(benchmarkNormalized !== undefined ? { benchmarkNormalized } : {}),
+      };
+    });
+
+    const latestClose = points[points.length - 1].close;
+    const regPrice = typeof meta.regularMarketPrice === 'number' ? Number((meta.regularMarketPrice * fx).toFixed(2)) : latestClose;
+    const totalChangeAmount = Number((regPrice - startPrice).toFixed(2));
+    const totalChangePercent = startPrice > 0 ? Number(((totalChangeAmount / startPrice) * 100).toFixed(2)) : 0;
+
+    const fiftyTwoWeekHigh = typeof meta.fiftyTwoWeekHigh === 'number' && meta.fiftyTwoWeekHigh > 0
+      ? Number((meta.fiftyTwoWeekHigh * fx).toFixed(2))
+      : Number(Math.max(highPrice, regPrice).toFixed(2));
+    const fiftyTwoWeekLow = typeof meta.fiftyTwoWeekLow === 'number' && meta.fiftyTwoWeekLow > 0
+      ? Number((meta.fiftyTwoWeekLow * fx).toFixed(2))
+      : Number(Math.min(lowPrice, regPrice).toFixed(2));
+
+    const payload = {
+      timeframe,
+      ticker: cleanTicker,
+      benchmark: benchmark !== 'none' ? benchmark : undefined,
+      source: 'YAHOO_FINANCE_LIVE',
+      data: points,
+      startPrice,
+      currentPrice: regPrice,
+      highPrice: Number(highPrice.toFixed(2)),
+      lowPrice: Number(lowPrice.toFixed(2)),
+      totalChangeAmount,
+      totalChangePercent,
+      isPositive: totalChangeAmount >= 0,
+      volumeTotal: totalVolume,
+      averageVolume: Math.floor(totalVolume / points.length),
+      fiftyTwoWeekHigh,
+      fiftyTwoWeekLow,
+    };
+
+    stockChartCache.set(cacheKey, { payload, expiresAt: Date.now() + cfg.ttlMs });
+    res.json(payload);
+  } catch (err: any) {
+    console.error('Error in /api/stock-chart:', err?.message || err);
+    res.status(500).json({ error: 'Failed to load stock chart data' });
+  }
+});
+
+// 2.5 GET /api/daily-earnings - Live-synced daily earnings calendar from Nasdaq Official Calendar + real-time quotes
+const nasdaqEarningsCache = new Map<string, { events: EarningsReportEvent[]; expiresAt: number }>();
+
+async function fetchNasdaqCalendarDay(dateStr: string): Promise<any[]> {
+  try {
+    const res = await fetch(`https://api.nasdaq.com/api/calendar/earnings?date=${encodeURIComponent(dateStr)}`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(5500),
+    });
+    if (!res.ok) return [];
+    const json: any = await res.json();
+    return Array.isArray(json?.data?.rows) ? json.data.rows : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseNasdaqDollarNum(val: any): number {
+  if (typeof val === 'number') return val;
+  if (!val) return NaN;
+  const s = String(val).replace(/[$,\s]/g, '').replace(/^\((.+)\)$/, '-$1');
+  const n = parseFloat(s);
+  return isNaN(n) ? NaN : n;
+}
+
+function mapNasdaqRowToEarningsEvent(
+  row: any,
+  dateStr: string,
+  dayCategory: 'TODAY' | 'TOMORROW' | 'THIS_WEEK' | 'LATER'
+): EarningsReportEvent {
+  const ticker = String(row.symbol || '').toUpperCase().trim();
+  const known = GLOBAL_STOCK_KNOWLEDGE[ticker];
+  const companyName = known?.name || String(row.name || `${ticker} Corp.`);
+  const sector = known?.sector || 'US Public Equities';
+  const sectorHe =
+    sector === 'Information Technology'
+      ? 'טכנולוגיה ושבבים'
+      : sector === 'Consumer Discretionary'
+      ? 'צריכה מחזורית וקמעונאות'
+      : sector === 'Consumer Staples'
+      ? 'צריכה בסיסית'
+      : sector === 'Financials'
+      ? 'פיננסים'
+      : sector === 'Health Care'
+      ? 'בריאות ופארמה'
+      : 'מניות ארה״ב (Nasdaq/NYSE)';
+
+  const rawTime = String(row.time || '');
+  const timing: 'BMO' | 'AMC' = rawTime === 'time-pre-market' ? 'BMO' : 'AMC';
+  const timingLabelHe = timing === 'BMO' ? 'לפני פתיחת המסחר (BMO)' : 'לאחר סגירת המסחר (AMC)';
+
+  const consensusEPS = parseNasdaqDollarNum(row.epsForecast);
+  const priorYearEPS = parseNasdaqDollarNum(row.lastYearEPS);
+  const safeConsensus = !isNaN(consensusEPS) ? consensusEPS : 0;
+  const safePrior = !isNaN(priorYearEPS) ? priorYearEPS : 0;
+  const yoyGrowthPct =
+    safePrior !== 0 && !isNaN(consensusEPS) && !isNaN(priorYearEPS)
+      ? `${((safeConsensus - safePrior) / Math.abs(safePrior) * 100) >= 0 ? '+' : ''}${(((safeConsensus - safePrior) / Math.abs(safePrior)) * 100).toFixed(1)}%`
+      : 'N/A';
+
+  const mcapNum = parseNasdaqDollarNum(row.marketCap);
+  const mcapLabel =
+    !isNaN(mcapNum) && mcapNum > 0
+      ? mcapNum >= 1e12
+        ? `$${(mcapNum / 1e12).toFixed(2)}T`
+        : mcapNum >= 1e9
+        ? `$${(mcapNum / 1e9).toFixed(1)}B`
+        : `$${(mcapNum / 1e6).toFixed(0)}M`
+      : 'N/A';
+
+  const fiscalQ = String(row.fiscalQuarterEnding || 'Upcoming Quarter');
+  const estCount = String(row.noOfEsts || 'N/A');
+
+  return {
+    id: `nasdaq-${dateStr}-${ticker}`,
+    ticker,
+    companyName,
+    companyNameHe: companyName,
+    sector,
+    sectorHe,
+    reportDate: dateStr,
+    dayCategory,
+    timing,
+    timingLabelHe,
+    fiscalQuarter: fiscalQ,
+    consensusEPS: Number(safeConsensus.toFixed(2)),
+    priorYearEPS: Number(safePrior.toFixed(2)),
+    yoyEpsGrowth: yoyGrowthPct,
+    consensusRevenue: mcapLabel !== 'N/A' ? `שווי שוק ${mcapLabel}` : 'ממתין לפרסום',
+    revenueYoY: yoyGrowthPct,
+    impliedMove: 'Live Scheduled',
+    status: 'UPCOMING',
+    statusLabelHe: timing === 'BMO' ? 'מתוכנן להיום (BMO)' : 'מתוכנן להיום (AMC)',
+    guidanceVerdict: 'PENDING',
+    guidanceVerdictHe: 'ממתין לשיחת ועידה',
+    guidanceDetailsHe: `תחזית קונצנזוס של ${estCount} אנליסטים בוול סטריט: $${safeConsensus.toFixed(2)} למניה (לעומת $${safePrior.toFixed(2)} אשתקד).`,
+    guidanceDetailsEn: `Wall Street consensus across ${estCount} analysts: $${safeConsensus.toFixed(2)} EPS (vs $${safePrior.toFixed(2)} prior year).`,
+    keyCallFocusHe: `מרווח תפעולי, הנחיות הנהלה לרבעון הבא וקצב צמיחת ההכנסות (${fiscalQ}).`,
+    keyCallFocusEn: `Operating margins, forward guidance revision, and revenue growth (${fiscalQ}).`,
+    aiTakeawayMemoHe: `${companyName} (${ticker}) צפויה לדווח ${timingLabelHe} לתקופת ${fiscalQ}. שווי שוק: ${mcapLabel}, קונצנזוס EPS: $${safeConsensus.toFixed(2)} (${estCount} אנליסטים).`,
+    aiTakeawayMemoEn: `${companyName} (${ticker}) scheduled to report ${timing} for ${fiscalQ}. Consensus EPS: $${safeConsensus.toFixed(2)} across ${estCount} estimates.`,
+    deepAnalysis: {
+      revenueBreakdown: `Scheduled earnings release for ${companyName} (${ticker}), market cap ${mcapLabel}.`,
+      revenueBreakdownHe: `דיווח רשמי מתוכנן של ${companyName} (${ticker}) בלוח הדוחות של נאסד״ק (שווי שוק: ${mcapLabel}).`,
+      operatingMarginAnalysis: `Market focus centers on ${fiscalQ} margin trajectory vs consensus EPS of $${safeConsensus.toFixed(2)}.`,
+      operatingMarginAnalysisHe: `מיקוד השוק: השוואת הרווח למניה בפועל לקונצנזוס ($${safeConsensus.toFixed(2)}) והשוואתו לתקופה המקבילה ($${safePrior.toFixed(2)}).`,
+      managementTone: 'Neutral',
+      managementToneHe: 'טרם דווח (ממתין לשיחה)',
+      keyQuotes: [`Scheduled earnings release: ${dateStr} (${timing}) — Fiscal Quarter: ${fiscalQ}`],
+      keyQuotesHe: [`מועד פרסום רשמי בנאסד״ק: ${dateStr} (${timingLabelHe}) — תקופה: ${fiscalQ}`],
+      guidanceCommentary: `Forward guidance will be evaluated after the ${timing} print across ${estCount} analyst estimates.`,
+      guidanceCommentaryHe: `הנחיות ההנהלה לשנת הכספים ינותחו מייד לאחר הפרסום (לחץ על חיפוש בטיקר לניתוח מלא מבוסס SEC).`,
+      catalystsAndRisks: {
+        bullPoints: [`Consensus EPS: $${safeConsensus.toFixed(2)} (${estCount} analysts)`, `YoY EPS trajectory: ${yoyGrowthPct}`],
+        bullPointsHe: [`קונצנזוס EPS: $${safeConsensus.toFixed(2)} (${estCount} אנליסטים)`, `צפי צמיחת EPS שנתית: ${yoyGrowthPct}`],
+        bearPoints: ['Guidance sensitivity & post-earnings volatility'],
+        bearPointsHe: ['תנודתיות חדה סביב תחזית ההנהלה לרבעון הבא'],
+      },
+      institutionalVerdict: {
+        action: 'HOLD',
+        actionHe: 'מעקב לפני דוח (Pre-Earnings Watch)',
+        actionEn: 'Pre-Earnings Watch',
+        targetPriceRevision: 'Pending Release',
+        targetPriceRevisionHe: 'ממתין לפרסום התוצאות',
+        confidenceScore: 84,
+        verdictMemoHe: `מומלץ להמתין לנתוני האמת והנחיות ההנהלה ב-${dateStr} ולקרוא את תזרים המזומנים בדו״ח ה-SEC המבוקר.`,
+        verdictMemoEn: `Wait for the official ${dateStr} release and forward guidance commentary before adjusting position sizing.`,
+      },
+    },
+  };
+}
+
+app.get('/api/daily-earnings', async (_req, res) => {
+  try {
+    const cached = nasdaqEarningsCache.get('GLOBAL_LIVE');
+    let liveEvents: EarningsReportEvent[] = [];
+
+    if (cached && cached.expiresAt > Date.now()) {
+      liveEvents = cached.events;
+    } else {
+      const today = new Date();
+      const dayOffsets: Array<{ offset: number; cat: 'TODAY' | 'TOMORROW' | 'THIS_WEEK' }> = [
+        { offset: 0, cat: 'TODAY' },
+        { offset: 1, cat: 'TOMORROW' },
+        { offset: 2, cat: 'THIS_WEEK' },
+        { offset: 3, cat: 'THIS_WEEK' },
+      ];
+
+      const dayResults = await Promise.all(
+        dayOffsets.map(async ({ offset, cat }) => {
+          const d = new Date(today.getTime() + offset * 24 * 60 * 60 * 1000);
+          const dateStr = d.toISOString().slice(0, 10);
+          const rows = await fetchNasdaqCalendarDay(dateStr);
+          // Sort by market cap descending and keep top liquid companies per day (cap 25 per day)
+          const cleanRows = rows
+            .filter((r) => r?.symbol && /^[A-Z.-]{1,6}$/.test(String(r.symbol).toUpperCase().trim()))
+            .sort((a, b) => (parseNasdaqDollarNum(b.marketCap) || 0) - (parseNasdaqDollarNum(a.marketCap) || 0))
+            .slice(0, 20);
+          return cleanRows.map((r) => mapNasdaqRowToEarningsEvent(r, dateStr, cat));
+        })
+      );
+
+      liveEvents = dayResults.flat();
+      nasdaqEarningsCache.set('GLOBAL_LIVE', {
+        events: liveEvents,
+        expiresAt: Date.now() + 15 * 60 * 1000,
+      });
+    }
+
+    // If weekends/holidays yield 0 rows on Nasdaq, fall back cleanly to curated seasonal reference events
+    const usingLiveNasdaq = liveEvents.length > 0;
+    const baseEvents = usingLiveNasdaq ? liveEvents : getDailyEarningsData();
+    const eventTickers = Array.from(new Set(baseEvents.map((e) => e.ticker.toUpperCase().trim()))).slice(0, 40);
     const quotesMap = await fetchBatchQuotesInChunks(eventTickers);
 
-    const enrichedEvents = rawEvents.map((evt) => {
+    const enrichedEvents = baseEvents.map((evt) => {
       const q = quotesMap[evt.ticker.toUpperCase().trim()] || liveQuotesCache.get(evt.ticker.toUpperCase().trim())?.quote;
-      if (q && typeof q.price === 'number') {
+      if (q && typeof q.price === 'number' && q.source !== 'fallback_estimate') {
         return {
           ...evt,
           livePrice: q.price,
@@ -1814,7 +2270,8 @@ app.get('/api/daily-earnings', async (req, res) => {
     res.json({
       events: enrichedEvents,
       timestamp: Date.now(),
-      status: 'success',
+      status: usingLiveNasdaq ? 'nasdaq_live' : 'market_holiday_fallback',
+      source: usingLiveNasdaq ? 'NASDAQ_LIVE_EARNINGS_CALENDAR' : 'CURATED_REFERENCE',
       totalCount: enrichedEvents.length,
     });
   } catch (err: any) {
@@ -2000,43 +2457,81 @@ app.post('/api/analyze-earnings-report', async (req, res) => {
 
     const ai = getAI();
     if (!isGeminiAvailable() || !ai) {
-      // Deterministic high-quality institutional fallback
+      // Deterministic SEC EDGAR + Yahoo Live Quote grounded teardown (no generic $10B stubs)
+      const [secSnap, liveQ] = await Promise.all([
+        fetchSecRealFinancialSnapshot(cleanTicker).catch(() => null),
+        fetchRealMarketQuote(cleanTicker).catch(() => null),
+      ]);
+
+      const fmtRev = (b?: number) => (b !== undefined ? (b >= 1 ? `$${b.toFixed(2)}B` : `$${(b * 1000).toFixed(1)}M`) : null);
+      const secRevStr = fmtRev(secSnap?.revenueB);
+      const secFcfStr = fmtRev(secSnap?.fcfB);
+      const secOpMargin =
+        secSnap?.operatingIncomeB !== undefined && secSnap?.revenueB && secSnap.revenueB > 0
+          ? ((secSnap.operatingIncomeB / secSnap.revenueB) * 100).toFixed(1)
+          : null;
+      const revYoYStr =
+        secSnap?.revenueYoYPct !== undefined
+          ? `${secSnap.revenueYoYPct >= 0 ? '+' : ''}${secSnap.revenueYoYPct.toFixed(1)}%`
+          : null;
+      const netDebtVal =
+        secSnap?.debtB !== undefined && secSnap?.cashB !== undefined ? secSnap.debtB - secSnap.cashB : null;
+      const resolvedName = secSnap?.entityName || liveQ?.companyName || companyName || `${cleanTicker} Corporation`;
+
       res.json({
         success: true,
         ticker: cleanTicker,
+        companyName: resolvedName,
+        companyNameHe: resolvedName,
+        sector: secSnap?.sicDescription || 'Public Equities',
+        sectorHe: secSnap?.sicDescription || 'מניות ציבוריות בארה״ב',
+        actualRevenue: actualRevenue || consensusRevenue || secRevStr || 'מבוסס SEC EDGAR',
+        revenueYoY: revYoYStr || 'N/A',
         deepAnalysis: {
-          revenueBreakdown: `${cleanTicker} Core Operations: ${actualRevenue || consensusRevenue || '$10B'}`,
-          revenueBreakdownHe: `הכנסות מגזר הליבה של ${cleanTicker}: ${actualRevenue || consensusRevenue || '$10B'}`,
-          operatingMarginAnalysis: `Operating profitability remains in line with institutional peer averages.`,
-          operatingMarginAnalysisHe: `שולי הרווח התפעולי תואמים את ממוצע חברות האיכות בענף, עם יציבות בתזרים המזומנים החופשי.`,
-          managementTone: 'Bullish',
-          managementToneHe: 'חיובי (Bullish)',
+          revenueBreakdown: `${resolvedName}: Annual SEC revenue ${secRevStr || actualRevenue || consensusRevenue || 'N/A'}${revYoYStr ? ` (${revYoYStr} YoY)` : ''}.`,
+          revenueBreakdownHe: `${resolvedName} — הכנסות שנתיות מדווחות ב-SEC: ${secRevStr || actualRevenue || consensusRevenue || 'לא דווח'}${revYoYStr ? ` (${revYoYStr} משנה שעברה)` : ''}.`,
+          operatingMarginAnalysis: `Operating Margin: ${secOpMargin ? `${secOpMargin}%` : 'N/A'} | Free Cash Flow: ${secFcfStr || 'N/A'}.`,
+          operatingMarginAnalysisHe: `מרווח תפעולי מדווח: ${secOpMargin ? `${secOpMargin}%` : 'לא דווח'} | תזרים מזומנים חופשי (FCF): ${secFcfStr || 'לא דווח'}.`,
+          managementTone: (secSnap?.revenueYoYPct ?? 0) > 8 ? 'Bullish' : 'Neutral',
+          managementToneHe: (secSnap?.revenueYoYPct ?? 0) > 8 ? 'חיובי (Bullish)' : 'מאוזן (Neutral)',
           keyQuotes: [
-            `"We continue to execute disciplined capital allocation and reinvest in durable moats."`,
+            `Verified SEC filing period ${secSnap?.periodEnd || 'Latest'} — Cash: ${fmtRev(secSnap?.cashB) || 'N/A'}, Debt: ${fmtRev(secSnap?.debtB) || 'N/A'}.`,
           ],
           keyQuotesHe: [
-            `"אנו ממשיכים לפעול במשמעת הקצאת הון ולהשקיע בהרחבת החפיר הכלכלי של החברה."`,
+            `נתוני מאזן מאומתים (תקופת ${secSnap?.periodEnd || 'אחרונה'}): מזומנים בקופה ${fmtRev(secSnap?.cashB) || '—'}, סך חוב ${fmtRev(secSnap?.debtB) || '—'}.`,
           ],
-          guidanceCommentary: `Management affirmed long-term organic growth milestones.`,
-          guidanceCommentaryHe: `ההנהלה אשררה את יעדי הצמיחה האורגנית לטווח הבינוני.`,
+          guidanceCommentary: liveQ && liveQ.source !== 'fallback_estimate'
+            ? `Current live market quote: $${liveQ.price.toFixed(2)} (${liveQ.changePercent >= 0 ? '+' : ''}${liveQ.changePercent}%).`
+            : `Monitor management forward guidance and SEC cash conversion.`,
+          guidanceCommentaryHe: liveQ && liveQ.source !== 'fallback_estimate'
+            ? `מחיר שוק חי כרגע: $${liveQ.price.toFixed(2)} (${liveQ.changePercent >= 0 ? '+' : ''}${liveQ.changePercent}%). יש לעקוב אחר עדכון תחזיות ההנהלה.`
+            : `יש לעקוב אחר עדכון התחזיות והמרת התזרים בדו״ח הקרוב.`,
           catalystsAndRisks: {
-            bullPoints: ['Durable recurring revenue base', 'Strong balance sheet'],
-            bullPointsHe: ['בסיס הכנסות חוזרות ויציבות', 'מאזן איתן עם נזילות גבוהה'],
-            bearPoints: ['Potential macroeconomic spending delays'],
-            bearPointsHe: ['רגישות להאטה בהוצאות לקוחות תחת תנאי מאקרו תנודתיים'],
+            bullPoints: [
+              secFcfStr ? `Reported FCF generation of ${secFcfStr}` : 'Institutional filing coverage available',
+              netDebtVal !== null && netDebtVal <= 0 ? 'Net cash balance sheet flexibility' : 'Disciplined capital allocation',
+            ],
+            bullPointsHe: [
+              secFcfStr ? `ייצור תזרים חופשי מבוקר (FCF) של ${secFcfStr}` : 'מעקב פונדמנטלי שוטף זמין',
+              netDebtVal !== null && netDebtVal <= 0 ? 'עודף מזומנים נטו במאזן (Net Cash)' : 'משמעת פיננסית בניהול החוב',
+            ],
+            bearPoints: ['Macroeconomic demand sensitivity and post-earnings volatility'],
+            bearPointsHe: ['רגישות להאטה בהוצאות לקוחות ותנודתיות סביב פרסום הדוח'],
           },
           institutionalVerdict: {
-            action: 'ACCUMULATE_ON_DIP',
-            actionHe: 'צבירה מבוקרת (Accumulate on Dip)',
-            actionEn: 'Accumulate on Dip',
-            targetPriceRevision: 'Reaffirmed overweight',
-            targetPriceRevisionHe: 'אשרור המלצת משקל יתר',
-            confidenceScore: 88,
-            verdictMemoHe: `דוח סולידי המאשרר את יכולת ייצור המזומנים. מומלץ למשקיעי ערך ואיכות לנצל ירידות שערים להגדלת פוזיציה.`,
-            verdictMemoEn: `Solid earnings release confirming cash generation. Quality investors can use market dips for position building.`,
+            action: (secSnap?.revenueYoYPct ?? 0) > 10 && (secSnap?.fcfB ?? 0) > 0 ? 'ACCUMULATE_ON_DIP' : 'HOLD',
+            actionHe: (secSnap?.revenueYoYPct ?? 0) > 10 && (secSnap?.fcfB ?? 0) > 0 ? 'צבירה מבוקרת (Accumulate on Dip)' : 'מעקב והמתנה לדוח (Monitor)',
+            actionEn: (secSnap?.revenueYoYPct ?? 0) > 10 && (secSnap?.fcfB ?? 0) > 0 ? 'Accumulate on Dip' : 'Monitor / Hold',
+            targetPriceRevision: liveQ && liveQ.source !== 'fallback_estimate' ? `Ref Price $${liveQ.price.toFixed(2)}` : 'SEC Verified',
+            targetPriceRevisionHe: liveQ && liveQ.source !== 'fallback_estimate' ? `מחיר ייחוס $${liveQ.price.toFixed(2)}` : 'מאומת SEC EDGAR',
+            confidenceScore: secSnap ? 90 : 80,
+            verdictMemoHe: secSnap
+              ? `ניתוח מבוסס דיווחי SEC רשמיים עבור ${resolvedName}: הכנסות ${secRevStr || '—'}, FCF של ${secFcfStr || '—'}, ומינוף ${netDebtVal !== null && netDebtVal <= 0 ? 'בעודף מזומנים' : 'מבוקר'}.`
+              : `נתוני הדוח הושלמו ממקורות השוק הזמינים. מומלץ לעקוב אחר תגובת השוק לאחר השיחה.`,
+            verdictMemoEn: `Grounded in SEC EDGAR filings for ${resolvedName}. Track forward margin and cash flow execution.`,
           },
         },
-        source: 'deterministic_engine',
+        source: secSnap ? 'sec_edgar_grounded_engine' : 'deterministic_engine',
       });
       return;
     }
@@ -3147,7 +3642,7 @@ app.post('/api/analyze-ticker', async (req, res) => {
       fetchSecRealFinancialSnapshot(cleanTicker).catch(() => null),
     ]);
 
-    // Check if pre-computed in universe first — still refresh live price & live marketCap so DCF/multiples stay exact
+    // Check if pre-computed in universe first — refresh live price, live marketCap & valuation multiples
     const existing = TOP_20_SUMMARY_LIST.find((s) => s.ticker === cleanTicker);
     if (existing) {
       const cloned: any = JSON.parse(JSON.stringify(existing));
@@ -3162,13 +3657,129 @@ app.post('/api/analyze-ticker', async (req, res) => {
             ? `$${nasdaqSummary.marketCapB.toFixed(2)}B`
             : `$${nasdaqSummary.marketCapB.toFixed(1)}B`;
       }
+
+      // Refresh trailing multiples & SEC figures dynamically using live market cap & audited SEC XBRL
+      const parseBillions = (valStr?: string): number => {
+        if (!valStr) return NaN;
+        const m = String(valStr).match(/(-?[0-9.,]+)\s*([TMB])?/i);
+        if (!m) return NaN;
+        const n = parseFloat(m[1].replace(/,/g, ''));
+        if (isNaN(n)) return NaN;
+        const unit = (m[2] || 'B').toUpperCase();
+        if (unit === 'T') return n * 1000;
+        if (unit === 'M') return n / 1000;
+        return n;
+      };
+      const fmtB = (b: number) => (Math.abs(b) < 0.5 && b !== 0 ? `$${(b * 1000).toFixed(1)}M` : `$${b.toFixed(2)}B`);
+
+      if (secSnapshot) {
+        if (secSnapshot.revenueB && secSnapshot.revenueB > 0 && cloned.growth?.revenueTTM) {
+          cloned.growth.revenueTTM.value = fmtB(secSnapshot.revenueB);
+        }
+        if (secSnapshot.fcfB !== undefined && cloned.financialQuality?.fcfTTM) {
+          cloned.financialQuality.fcfTTM.value = fmtB(secSnapshot.fcfB);
+        }
+        if (secSnapshot.cashB !== undefined && cloned.financialQuality?.cashAndEquivalents) {
+          cloned.financialQuality.cashAndEquivalents.value = fmtB(secSnapshot.cashB);
+        }
+        if (secSnapshot.debtB !== undefined && secSnapshot.cashB !== undefined && cloned.financialQuality?.netDebt) {
+          const nd = secSnapshot.debtB - secSnapshot.cashB;
+          cloned.financialQuality.netDebt.value = nd < 0 ? `-$${Math.abs(nd).toFixed(2)}B (Net Cash)` : `$${nd.toFixed(2)}B`;
+        }
+      }
+
+      const liveCapB = nasdaqSummary?.marketCapB || parseBillions(cloned.marketCap);
+      const revB = secSnapshot?.revenueB || parseBillions(cloned.growth?.revenueTTM?.value);
+      const fcfB = secSnapshot?.fcfB ?? parseBillions(cloned.financialQuality?.fcfTTM?.value);
+      const netDebtB =
+        secSnapshot?.debtB !== undefined && secSnapshot?.cashB !== undefined
+          ? secSnapshot.debtB - secSnapshot.cashB
+          : parseBillions(cloned.financialQuality?.netDebt?.value);
+
+      if (secSnapshot && revB > 0) {
+        if (secSnapshot.revenueYoYPct !== undefined && cloned.growth?.revenueYoY) {
+          cloned.growth.revenueYoY.value = `${secSnapshot.revenueYoYPct >= 0 ? '+' : ''}${secSnapshot.revenueYoYPct.toFixed(1)}%`;
+        }
+        if (secSnapshot.grossProfitB && cloned.financialQuality?.grossMargin) {
+          cloned.financialQuality.grossMargin.value = `${Math.min(95, Math.max(5, (secSnapshot.grossProfitB / revB) * 100)).toFixed(1)}%`;
+        }
+        if (secSnapshot.operatingIncomeB !== undefined && cloned.financialQuality?.operatingMargin) {
+          cloned.financialQuality.operatingMargin.value = `${Math.min(85, Math.max(-50, (secSnapshot.operatingIncomeB / revB) * 100)).toFixed(1)}%`;
+        }
+        if (secSnapshot.netIncomeB !== undefined && cloned.financialQuality?.netMargin) {
+          cloned.financialQuality.netMargin.value = `${Math.min(85, Math.max(-50, (secSnapshot.netIncomeB / revB) * 100)).toFixed(1)}%`;
+        }
+        if (!isNaN(fcfB) && cloned.financialQuality?.fcfMargin) {
+          cloned.financialQuality.fcfMargin.value = `${Math.min(85, Math.max(-80, (fcfB / revB) * 100)).toFixed(1)}%`;
+        }
+      }
+
+      if (liveCapB > 0 && cloned.valuation) {
+        if (!isNaN(fcfB) && fcfB > 0) {
+          const evB = Math.max(0.2, liveCapB + (isNaN(netDebtB) ? 0 : netDebtB));
+          if (cloned.valuation.fcfYield) cloned.valuation.fcfYield.value = `${((fcfB / liveCapB) * 100).toFixed(2)}%`;
+          if (cloned.valuation.evToFCF) cloned.valuation.evToFCF.value = `${(evB / fcfB).toFixed(1)}x`;
+        } else if (!isNaN(fcfB) && fcfB <= 0) {
+          if (cloned.valuation.fcfYield) cloned.valuation.fcfYield.value = `${((fcfB / liveCapB) * 100).toFixed(2)}%`;
+        }
+        if (!isNaN(revB) && revB > 0 && cloned.valuation.psRatio) {
+          cloned.valuation.psRatio.value = `${(liveCapB / revB).toFixed(1)}x`;
+        }
+        // Guard against one-time unrealized investment / spin-off gains inflating GAAP Net Income > 1.45x Operating Income
+        const secOpB = secSnapshot?.operatingIncomeB;
+        const secNetB = secSnapshot?.netIncomeB;
+        const normalizedEarnB =
+          secOpB && secOpB > 0 && (!secNetB || secNetB > secOpB * 1.45 || secNetB <= 0)
+            ? Number((secOpB * 0.85).toFixed(2))
+            : secNetB;
+        if (normalizedEarnB && normalizedEarnB > 0 && cloned.valuation.peTTM) {
+          const calcPe = liveCapB / normalizedEarnB;
+          cloned.valuation.peTTM.value = `${calcPe.toFixed(1)}x`;
+          if (cloned.valuation.forwardPE) {
+            cloned.valuation.forwardPE.value = `${(calcPe * 0.90).toFixed(1)}x`;
+          }
+        }
+      }
+
+      if (nasdaqSummary?.divYieldPct !== undefined && cloned.perShareValueCreation) {
+        cloned.perShareValueCreation.dividendYield = `${nasdaqSummary.divYieldPct.toFixed(2)}%`;
+      }
+
+      if (nasdaqSummary?.oneYrTarget && nasdaqSummary.oneYrTarget > 0 && cloned.analysts?.averagePriceTarget) {
+        cloned.analysts.averagePriceTarget.value = `$${nasdaqSummary.oneYrTarget.toFixed(2)}`;
+        cloned.analysts.averagePriceTarget.source = 'Nasdaq / Wall St Consensus';
+      }
+
+      if (cloned.analysts?.averagePriceTarget?.value && liveQuote?.price > 0) {
+        const tgtNum = parseFloat(String(cloned.analysts.averagePriceTarget.value).replace(/[^0-9.]/g, ''));
+        if (!isNaN(tgtNum) && tgtNum > 0) {
+          const upsidePct = ((tgtNum - liveQuote.price) / liveQuote.price) * 100;
+          cloned.analysts.impliedAnalystUpside = `${upsidePct >= 0 ? '+' : ''}${upsidePct.toFixed(1)}%`;
+        }
+      }
+
       const localized = localizeStock(cloned, safeLang);
       res.json({ stock: localized, source: 'precomputed_sec_live_grounded' });
       return;
     }
 
     const knownCvsOrOther = GLOBAL_STOCK_KNOWLEDGE[cleanTicker];
-    const fallbackGroundPrice = knownCvsOrOther ? knownCvsOrOther.price : '$86.00';
+    const hasRealQuote = Boolean(liveQuote && liveQuote.source !== 'fallback_estimate' && liveQuote.price > 0);
+    const hasKnownPrice = Boolean(KNOWN_CATALOG_PRICES[cleanTicker]);
+
+    // Strict verification: NEVER fabricate fake $100 / $15B reports for invalid/nonexistent ticker symbols
+    if (!hasRealQuote && !secSnapshot && !nasdaqSummary && !knownCvsOrOther && !hasKnownPrice) {
+      res.status(404).json({
+        error: safeLang === 'he'
+          ? `הסימול "${cleanTicker}" לא נמצא בבורסות ארה״ב או במאגר SEC EDGAR. בדוק את האיות ונסה שוב.`
+          : `Ticker "${cleanTicker}" was not found on US exchanges or in the SEC EDGAR registry.`,
+        code: 'TICKER_NOT_FOUND',
+        ticker: cleanTicker,
+      });
+      return;
+    }
+
+    const fallbackGroundPrice = knownCvsOrOther ? knownCvsOrOther.price : KNOWN_CATALOG_PRICES[cleanTicker] ? `$${KNOWN_CATALOG_PRICES[cleanTicker].toFixed(2)}` : '$86.00';
     const realPriceFormatted = liveQuote && typeof liveQuote.price === 'number' && liveQuote.price > 0
       ? `$${liveQuote.price.toFixed(2)}`
       : fallbackGroundPrice;
@@ -3445,14 +4056,25 @@ Return ONLY a valid JSON object matching this exact TypeScript structure:
   } catch (error) {
     console.error('Error analyzing ticker:', error);
     const { ticker, language = 'en' } = req.body || {};
-    const rawTicker = (ticker && typeof ticker === 'string' ? ticker.trim() : 'UNKNOWN');
+    const rawTicker = (ticker && typeof ticker === 'string' ? ticker.trim() : '');
     const safeTicker = SERVER_TICKER_ALIASES[rawTicker.toUpperCase()] || SERVER_TICKER_ALIASES[rawTicker] || rawTicker.toUpperCase();
     const safeLang = typeof language === 'string' && ['he', 'en', 'de', 'fr', 'es'].includes(language) ? language : 'en';
     const [liveQuote, nasdaqSummary, secSnapshot] = await Promise.all([
-      fetchRealMarketQuote(safeTicker).catch(() => null),
-      fetchNasdaqMarketSummary(safeTicker).catch(() => null),
-      fetchSecRealFinancialSnapshot(safeTicker).catch(() => null),
+      safeTicker ? fetchRealMarketQuote(safeTicker).catch(() => null) : Promise.resolve(null),
+      safeTicker ? fetchNasdaqMarketSummary(safeTicker).catch(() => null) : Promise.resolve(null),
+      safeTicker ? fetchSecRealFinancialSnapshot(safeTicker).catch(() => null) : Promise.resolve(null),
     ]);
+    const hasRealQ = Boolean(liveQuote && liveQuote.source !== 'fallback_estimate' && liveQuote.price > 0);
+    if (!safeTicker || (!hasRealQ && !secSnapshot && !nasdaqSummary && !GLOBAL_STOCK_KNOWLEDGE[safeTicker] && !KNOWN_CATALOG_PRICES[safeTicker])) {
+      res.status(404).json({
+        error: safeLang === 'he'
+          ? `הסימול "${safeTicker || '?'}" לא נמצא בבורסות ארה״ב או במאגר SEC EDGAR.`
+          : `Ticker "${safeTicker || '?'}" was not found on US exchanges or in SEC EDGAR.`,
+        code: 'TICKER_NOT_FOUND',
+        ticker: safeTicker,
+      });
+      return;
+    }
     const fallbackStock = generateFallbackStockAudit(safeTicker, safeLang, liveQuote, secSnapshot, nasdaqSummary);
     res.json({ stock: fallbackStock, source: secSnapshot ? 'sec_xbrl_grounded_model' : 'grounded_institutional_sec_model' });
   }
@@ -3461,6 +4083,7 @@ Return ONLY a valid JSON object matching this exact TypeScript structure:
 interface NasdaqMarketSummary {
   marketCapB?: number;
   divYieldPct?: number;
+  oneYrTarget?: number;
 }
 
 const nasdaqSummaryCache = new Map<string, { data: NasdaqMarketSummary | null; expiresAt: number }>();
@@ -3482,14 +4105,25 @@ async function fetchNasdaqMarketSummary(ticker: string): Promise<NasdaqMarketSum
       return null;
     }
     const json: any = await res.json();
-    const sd = json?.data?.summaryData || {};
+    const sd = json?.data?.summaryData;
+    if (!sd || typeof sd !== 'object') {
+      nasdaqSummaryCache.set(cleanTicker, { data: null, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return null;
+    }
     const mcapRaw = String(sd.MarketCap?.value || '').replace(/,/g, '');
     const mcapNum = Number(mcapRaw);
     const marketCapB = !isNaN(mcapNum) && mcapNum > 0 ? Number((mcapNum / 1e9).toFixed(3)) : undefined;
     const yieldRaw = String(sd.Yield?.value || '').replace(/[^0-9.]/g, '');
     const divYieldNum = parseFloat(yieldRaw);
     const divYieldPct = !isNaN(divYieldNum) && divYieldNum >= 0 ? divYieldNum : undefined;
-    const result: NasdaqMarketSummary = { marketCapB, divYieldPct };
+    const targetRaw = String(sd.OneYrTarget?.value || '').replace(/[^0-9.]/g, '');
+    const targetNum = parseFloat(targetRaw);
+    const oneYrTarget = !isNaN(targetNum) && targetNum > 0 ? Number(targetNum.toFixed(2)) : undefined;
+    if (marketCapB === undefined && divYieldPct === undefined && oneYrTarget === undefined) {
+      nasdaqSummaryCache.set(cleanTicker, { data: null, expiresAt: Date.now() + 10 * 60 * 1000 });
+      return null;
+    }
+    const result: NasdaqMarketSummary = { marketCapB, divYieldPct, oneYrTarget };
     nasdaqSummaryCache.set(cleanTicker, { data: result, expiresAt: Date.now() + 30 * 60 * 1000 });
     return result;
   } catch {
@@ -3597,7 +4231,7 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
       return { arr: [], fx: 1 };
     };
 
-    const extractAnnualSeries = (tagNames: string[]): { end: string; val: number }[] => {
+    const extractAnnualSeries = (tagNames: string[], preferLargestOnTie = false): { end: string; val: number }[] => {
       let bestSeries: { end: string; val: number }[] = [];
       let bestMaxYear = -1;
       for (const tag of tagNames) {
@@ -3625,7 +4259,12 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
             .sort((a, b) => Number(b[0]) - Number(a[0]))
             .map(([yr, val]) => ({ end: yr, val }));
           const maxYr = Number(series[0]?.end || 0);
-          if (maxYr > bestMaxYear) {
+          const beatsYear = maxYr > bestMaxYear;
+          const beatsTieBySize =
+            preferLargestOnTie &&
+            maxYr === bestMaxYear &&
+            Math.abs(series[0]?.val || 0) > Math.abs(bestSeries[0]?.val || 0) * 1.15;
+          if (beatsYear || beatsTieBySize) {
             bestMaxYear = maxYr;
             bestSeries = series;
           }
@@ -3641,10 +4280,14 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
         if (!arr.length) continue;
         const valid = arr
           .filter((pt) => typeof pt?.val === 'number' && pt?.end)
-          .sort((a, b) => new Date(b.end).getTime() - new Date(a.end).getTime());
+          .sort((a, b) => new Date(b.end).getTime() - new Date(a.end).getTime() || Math.abs(b.val) - Math.abs(a.val));
         if (valid.length > 0) {
           const cand = { end: String(valid[0].end), val: Number(valid[0].val) * fx };
-          if (!bestPoint || cand.end > bestPoint.end) {
+          if (
+            !bestPoint ||
+            cand.end > bestPoint.end ||
+            (cand.end === bestPoint.end && bestPoint.val === 0 && Math.abs(cand.val) > 0)
+          ) {
             bestPoint = cand;
           }
         }
@@ -3652,19 +4295,34 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
       return bestPoint;
     };
 
-    const revSeries = extractAnnualSeries([
-      'RevenueFromContractWithCustomerExcludingAssessedTax',
+    const revCandidateTags = [
+      'RevenuesNetOfInterestExpense',
       'Revenues',
-      'SalesRevenueNet',
       'TotalRevenuesAndOtherIncome',
+      'SalesRevenueNet',
+      'RevenueFromContractWithCustomerExcludingAssessedTax',
+      'RevenueFromContractWithCustomerIncludingAssessedTax',
+      'SalesRevenueServicesNet',
+      'InterestAndDividendIncomeOperating',
+      'RealEstateRevenueNet',
       'Revenue',
       'RevenueFromContractsWithCustomers',
-    ]);
+    ];
+    const revSeries = extractAnnualSeries(revCandidateTags, true);
     const grossSeries = extractAnnualSeries(['GrossProfit']);
-    const opSeries = extractAnnualSeries(['OperatingIncomeLoss', 'ProfitLossFromOperatingActivities']);
-    const netSeries = extractAnnualSeries(['NetIncomeLoss', 'ProfitLoss']);
+    const opSeries = extractAnnualSeries([
+      'OperatingIncomeLoss',
+      'ProfitLossFromOperatingActivities',
+      'IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
+    ]);
+    const netSeries = extractAnnualSeries([
+      'NetIncomeLoss',
+      'ProfitLoss',
+      'NetIncomeLossAvailableToCommonStockholdersBasic',
+    ]);
     const ocfSeries = extractAnnualSeries([
       'NetCashProvidedByUsedInOperatingActivities',
+      'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
       'CashFlowsFromUsedInOperatingActivities',
     ]);
     const capexSeries = extractAnnualSeries([
@@ -3686,20 +4344,34 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
     const cashPoint = extractLatestPoint([
       'CashCashEquivalentsAndShortTermInvestments',
       'CashAndCashEquivalentsAtCarryingValue',
+      'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents',
       'CashAndCashEquivalents',
     ]);
-    const ltDebtPoint = extractLatestPoint([
+    const ltNoncurrentDebtPoint = extractLatestPoint([
       'ConvertibleLongTermNotesPayable',
       'LongTermDebtNoncurrent',
-      'LongTermDebt',
-      'LongTermDebtAndCapitalLeaseObligations',
       'NoncurrentFinancialLiabilities',
-      'Borrowings',
+      'NotesPayable',
+      'UnsecuredDebt',
+      'SeniorLongTermNotes',
+      'SeniorNotes',
+      'SecuredDebt',
+      'MortgagesPayable',
     ]);
     const stDebtPoint = extractLatestPoint([
+      'LongTermDebtCurrent',
       'DebtCurrent',
       'ShortTermBorrowings',
       'CurrentBorrowingsAndCurrentPortionOfNoncurrentBorrowings',
+    ]);
+    const totalDebtPoint = extractLatestPoint([
+      'DebtAndCapitalLeaseObligations',
+      'LongTermDebtAndCapitalLeaseObligations',
+      'LongTermDebt',
+      'Borrowings',
+      'NotesPayable',
+      'SecuredDebt',
+      'UnsecuredDebt',
     ]);
 
     // Shares outstanding
@@ -3715,22 +4387,98 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
       ? sortedShares.find((s) => String(s.end).slice(0, 4) !== String(sortedShares[0]?.end).slice(0, 4))!.val / 1e6
       : undefined;
 
-    const revenueB = revSeries[0] ? revSeries[0].val / 1e9 : undefined;
-    const revenuePriorB = revSeries[1] ? revSeries[1].val / 1e9 : undefined;
+    let periodEndLabel = revSeries[0]?.end || cashPoint?.end?.slice(0, 4) || '2025';
+    let revenueB = revSeries[0] ? revSeries[0].val / 1e9 : undefined;
+    let revenuePriorB = revSeries[1] ? revSeries[1].val / 1e9 : undefined;
+    let grossProfitB = grossSeries[0] ? grossSeries[0].val / 1e9 : undefined;
+    let operatingIncomeB = opSeries[0] ? opSeries[0].val / 1e9 : undefined;
+    let operatingIncomePriorB = opSeries[1] ? opSeries[1].val / 1e9 : undefined;
+    let netIncomeB = netSeries[0] ? netSeries[0].val / 1e9 : undefined;
+    let ocfB = ocfSeries[0] ? ocfSeries[0].val / 1e9 : undefined;
+    let capexB = capexSeries[0] ? Math.abs(capexSeries[0].val) / 1e9 : 0;
+
+    // Upgrade to true Trailing 12 Months (TTM) when newer standalone 10-Q quarters exist beyond latest 10-K
+    try {
+      const qRevAll = extractStandaloneQuarterPoints(factsJson, revCandidateTags).filter((q) => (q.periodDays || 90) <= 125);
+      const latestRevEndYear = revSeries[0]?.end ? Number(revSeries[0].end) : 0;
+      const latestQYear = qRevAll[0]?.end ? Number(qRevAll[0].end.slice(0, 4)) : 0;
+      const hasNewerQuarter =
+        qRevAll.length >= 4 &&
+        (latestQYear > latestRevEndYear || (cashPoint?.end && cashPoint.end > `${latestRevEndYear}-08-01` && qRevAll[0].end >= cashPoint.end.slice(0, 8)));
+
+      if (hasNewerQuarter) {
+        const sumTop4 = (pts: XbrlQuarterPoint[]) => {
+          const filtered = pts.filter((q) => (q.periodDays || 90) <= 125);
+          if (filtered.length < 4) return undefined;
+          return filtered.slice(0, 4).reduce((acc, q) => acc + q.val, 0) / 1e9;
+        };
+        const ttmRev = sumTop4(qRevAll);
+        if (ttmRev && ttmRev > 0) {
+          revenueB = Number(ttmRev.toFixed(3));
+          periodEndLabel = `TTM (${qRevAll[0].end})`;
+          if (qRevAll.length >= 8) {
+            revenuePriorB = Number((qRevAll.slice(4, 8).reduce((acc, q) => acc + q.val, 0) / 1e9).toFixed(3));
+          }
+          const ttmGross = sumTop4(extractStandaloneQuarterPoints(factsJson, ['GrossProfit']));
+          if (ttmGross !== undefined) grossProfitB = Number(ttmGross.toFixed(3));
+          const qOpAll = extractStandaloneQuarterPoints(factsJson, [
+            'OperatingIncomeLoss',
+            'ProfitLossFromOperatingActivities',
+            'IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
+          ]).filter((q) => (q.periodDays || 90) <= 125);
+          const ttmOp = sumTop4(qOpAll);
+          if (ttmOp !== undefined) {
+            operatingIncomeB = Number(ttmOp.toFixed(3));
+            if (qOpAll.length >= 8) {
+              operatingIncomePriorB = Number((qOpAll.slice(4, 8).reduce((acc, q) => acc + q.val, 0) / 1e9).toFixed(3));
+            }
+          }
+          const ttmNet = sumTop4(extractStandaloneQuarterPoints(factsJson, [
+            'NetIncomeLoss',
+            'ProfitLoss',
+            'NetIncomeLossAvailableToCommonStockholdersBasic',
+          ]));
+          if (ttmNet !== undefined) netIncomeB = Number(ttmNet.toFixed(3));
+          const ttmOcf = sumTop4(extractStandaloneQuarterPoints(factsJson, [
+            'NetCashProvidedByUsedInOperatingActivities',
+            'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+            'CashFlowsFromUsedInOperatingActivities',
+          ]));
+          if (ttmOcf !== undefined) ocfB = Number(ttmOcf.toFixed(3));
+          const ttmCapex = sumTop4(extractStandaloneQuarterPoints(factsJson, [
+            'PaymentsToAcquirePropertyPlantAndEquipment',
+            'PaymentsToAcquireProductiveAssets',
+            'PaymentsForCapitalImprovements',
+            'PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets',
+          ]));
+          if (ttmCapex !== undefined) capexB = Number(Math.abs(ttmCapex).toFixed(3));
+        }
+      }
+    } catch {
+      // keep annual series
+    }
+
     const revenueYoYPct =
       revenueB !== undefined && revenuePriorB !== undefined && revenuePriorB > 0
         ? ((revenueB - revenuePriorB) / revenuePriorB) * 100
         : undefined;
 
-    const grossProfitB = grossSeries[0] ? grossSeries[0].val / 1e9 : undefined;
-    const operatingIncomeB = opSeries[0] ? opSeries[0].val / 1e9 : undefined;
-    const operatingIncomePriorB = opSeries[1] ? opSeries[1].val / 1e9 : undefined;
-    const netIncomeB = netSeries[0] ? netSeries[0].val / 1e9 : undefined;
-    const ocfB = ocfSeries[0] ? ocfSeries[0].val / 1e9 : undefined;
-    const capexB = capexSeries[0] ? Math.abs(capexSeries[0].val) / 1e9 : 0;
     const fcfB = ocfB !== undefined ? Number((ocfB - capexB).toFixed(4)) : undefined;
     const cashB = cashPoint ? cashPoint.val / 1e9 : undefined;
-    const debtB = ((ltDebtPoint?.val || 0) + (stDebtPoint?.val || 0)) / 1e9;
+
+    // Combine non-current + current debt accurately (preferring latest filing date)
+    const ltNoncurrentVal =
+      ltNoncurrentDebtPoint && (!stDebtPoint || ltNoncurrentDebtPoint.end >= stDebtPoint.end)
+        ? Math.max(0, ltNoncurrentDebtPoint.val)
+        : 0;
+    const stVal = stDebtPoint ? Math.max(0, stDebtPoint.val) : 0;
+    const combinedSplitDebt = ltNoncurrentVal + stVal;
+    const totalFallbackVal =
+      totalDebtPoint && (!stDebtPoint || totalDebtPoint.end >= stDebtPoint.end)
+        ? Math.max(0, totalDebtPoint.val)
+        : 0;
+    const debtVal = combinedSplitDebt > 0 ? Math.max(combinedSplitDebt, totalFallbackVal) : totalFallbackVal;
+    const debtB = debtVal / 1e9;
     const dividendsPaidB = divSeries[0] ? Math.abs(divSeries[0].val) / 1e9 : undefined;
 
     const snapshot: SecRealFinancialSnapshot = {
@@ -3738,7 +4486,7 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
       entityName,
       exchange: exchange.includes('NYSE') ? 'NYSE' : 'NASDAQ',
       sicDescription,
-      periodEnd: revSeries[0]?.end || cashPoint?.end?.slice(0, 4) || '2025',
+      periodEnd: periodEndLabel,
       revenueB,
       revenuePriorB,
       revenueYoYPct,
@@ -3834,11 +4582,16 @@ function generateFallbackStockAudit(
   const fcfConversionPct = netIncomeB > 0 && fcfB > 0 ? Math.min(250, Math.max(20, (fcfB / netIncomeB) * 100)) : fcfB <= 0 ? 0 : 102.0;
 
   // Valuation multiples calculated directly from real Market Cap, Enterprise Value & Earnings/FCF
+  // Guard against one-time spin-off/tax windfalls where GAAP Net Income > Operating Income * 1.45
   const evB = Math.max(0.2, capB + netDebtB);
   const fcfYieldPct = capB > 0 ? (fcfB / capB) * 100 : 4.2;
   const evToFCF = fcfB > 0 ? evB / fcfB : 35.0;
-  const peTTM = netIncomeB > 0 ? capB / netIncomeB : 24.0;
-  const fwdPE = netIncomeB > 0 ? peTTM * 0.92 : parseFloat((known?.fwdPe || '21.0').replace(/[^0-9.]/g, '')) || 21.0;
+  const normalizedEarningsB =
+    operatingIncomeB > 0 && netIncomeB > operatingIncomeB * 1.45
+      ? Number((operatingIncomeB * 0.85).toFixed(2))
+      : netIncomeB;
+  const peTTM = normalizedEarningsB > 0 ? capB / normalizedEarningsB : 24.0;
+  const fwdPE = normalizedEarningsB > 0 ? peTTM * 0.90 : parseFloat((known?.fwdPe || '21.0').replace(/[^0-9.]/g, '')) || 21.0;
   const psRatio = revenueB > 0 ? capB / revenueB : 4.5;
 
   // Honest dynamic scoring based on actual fundamental metrics (NOT static 82!)
@@ -3871,9 +4624,14 @@ function generateFallbackStockAudit(
   const resolvedCagrRange = known?.cagr || `${cagrLow}% – ${cagrHigh}%`;
   const roicEstStr = known?.roic || `${Math.min(45, Math.max(9, Math.round(opMarginPct * 0.72))).toFixed(1)}%`;
 
-  // Realistic 12M analyst price target derived from live price & fundamentals (e.g., +8% to +22%)
-  const impliedTargetUpsidePct = Math.round(Math.min(24, Math.max(-5, (Math.max(0, fcfYieldPct) - 3.0) * 3.0 + (revYoYPct - 5) * 0.55 + 8)));
-  const consensusTargetNum = Number((priceNum * (1 + impliedTargetUpsidePct / 100)).toFixed(2));
+  // 12M Wall St consensus price target (prefer official Nasdaq 1Y Target when available)
+  const fallbackTargetUpsidePct = Math.round(Math.min(24, Math.max(-5, (Math.max(0, fcfYieldPct) - 3.0) * 3.0 + (revYoYPct - 5) * 0.55 + 8)));
+  const consensusTargetNum =
+    nasdaqSummary?.oneYrTarget && nasdaqSummary.oneYrTarget > 0
+      ? nasdaqSummary.oneYrTarget
+      : Number((priceNum * (1 + fallbackTargetUpsidePct / 100)).toFixed(2));
+  const impliedTargetUpsidePct =
+    priceNum > 0 ? Math.round(((consensusTargetNum - priceNum) / priceNum) * 100) : fallbackTargetUpsidePct;
 
   // Detect real red flags (e.g. margin compression or slower top-line growth or negative FCF CapEx cycle)
   const operatingMarginDeclined =
@@ -3926,7 +4684,7 @@ function generateFallbackStockAudit(
     : `${ticker} combines a ${fcfYieldPct.toFixed(1)}% FCF yield, ${fcfMarginPct.toFixed(1)}% FCF margin, and ${netDebtB <= 0 ? 'net cash balance sheet' : 'manageable leverage'}.`;
 
   const secCitation = sec ? `SEC ${sec.periodEnd} Filing` : 'Market Model Estimate';
-  const periodLabel = sec?.periodEnd ? `FY ${sec.periodEnd}` : 'TTM';
+  const periodLabel = sec?.periodEnd ? (sec.periodEnd.startsWith('TTM') ? sec.periodEnd : `FY ${sec.periodEnd}`) : 'TTM';
 
   const redFlagsList: any[] = [];
   if (revYoYPct < 8) {
@@ -4075,7 +4833,11 @@ function generateFallbackStockAudit(
       consensusForwardRevenue: { value: fmtMoneyB(revenueB * (1 + Math.max(0.03, revYoYPct / 100))), period: 'NTM', source: 'SEC Grounded' },
       epsRevisions30D: revYoYPct >= 10 ? '+7 Up / 2 Down' : '+3 Up / 3 Down',
       epsRevisions90D: revYoYPct >= 10 ? '+14 Up / 4 Down' : '+6 Up / 5 Down',
-      averagePriceTarget: { value: `$${consensusTargetNum.toFixed(2)}`, period: '12M Target', source: 'Grounded Consensus' },
+      averagePriceTarget: {
+        value: `$${consensusTargetNum.toFixed(2)}`,
+        period: '12M Target',
+        source: nasdaqSummary?.oneYrTarget ? 'Nasdaq / Wall St Consensus' : 'Grounded Consensus',
+      },
       impliedAnalystUpside: `${impliedTargetUpsidePct >= 0 ? '+' : ''}${impliedTargetUpsidePct}%`,
       analystMomentum: revYoYPct >= 10 ? 'Improving' : 'Stable',
       qualityWeightedSignal: isHe ? 'תחזית שמרנית-מאוזנת בהתבסס על תזרים המזומנים והצמיחה בפועל.' : 'Balanced risk-reward anchored in reported cash flow.',
@@ -4200,6 +4962,7 @@ interface XbrlQuarterPoint {
   filed?: string;
   accn?: string;
   frame?: string;
+  periodDays?: number;
 }
 
 function daysBetween(startStr?: string, endStr?: string): number {
@@ -4210,29 +4973,64 @@ function daysBetween(startStr?: string, endStr?: string): number {
   return Math.round((e - s) / (1000 * 60 * 60 * 24));
 }
 
+const SEC_XBRL_FX_TO_USD: Record<string, number> = {
+  USD: 1.0,
+  EUR: 1.085,
+  TWD: 0.0308,
+  CNY: 0.138,
+  RMB: 0.138,
+  DKK: 0.144,
+  GBP: 1.27,
+  JPY: 0.0065,
+  ILS: 0.275,
+  CAD: 0.72,
+  CHF: 1.13,
+};
+
+function pickSecUnitsArray(tagObj: any, unitType: 'USD' | 'USD/shares' = 'USD'): { arr: any[]; fx: number } {
+  const units = tagObj?.units || {};
+  const curs = ['USD', 'EUR', 'TWD', 'CNY', 'RMB', 'DKK', 'GBP', 'JPY', 'ILS', 'CAD', 'CHF'];
+  for (const cur of curs) {
+    if (unitType === 'USD/shares') {
+      const k1 = `${cur}/shares`;
+      const k2 = `${cur} / shares`;
+      if (Array.isArray(units[k1]) && units[k1].length > 0) return { arr: units[k1], fx: SEC_XBRL_FX_TO_USD[cur] || 1 };
+      if (Array.isArray(units[k2]) && units[k2].length > 0) return { arr: units[k2], fx: SEC_XBRL_FX_TO_USD[cur] || 1 };
+    } else {
+      if (Array.isArray(units[cur]) && units[cur].length > 0) {
+        return { arr: units[cur], fx: SEC_XBRL_FX_TO_USD[cur] || 1 };
+      }
+    }
+  }
+  return { arr: [], fx: 1 };
+}
+
+const ALLOWED_SEC_PERIODIC_FORMS = new Set([
+  '10-Q', '10-Q/A', '10-K', '10-K/A',
+  '20-F', '20-F/A', '40-F', '40-F/A',
+  '6-K', '6-K/A',
+]);
+
 function extractStandaloneQuarterPoints(
   factsRoot: any,
   tagCandidates: string[],
   unitType: 'USD' | 'USD/shares' = 'USD'
-): XbrlQuarterPoint[] {
+): Array<XbrlQuarterPoint & { periodDays?: number }> {
   const usGaap = factsRoot?.facts?.['us-gaap'] || {};
   const ifrs = factsRoot?.facts?.['ifrs-full'] || {};
 
   // Deduplicate exact (start, end) keeping latest filed & highest-priority tag candidate
-  const bySpanKey = new Map<string, XbrlQuarterPoint & { priority: number }>();
+  const bySpanKey = new Map<string, XbrlQuarterPoint & { priority: number; periodDays: number }>();
 
   tagCandidates.forEach((tag, tagIdx) => {
     const tagObj = usGaap[tag] || ifrs[tag];
     if (!tagObj?.units) return;
-    const unitArr: any[] =
-      unitType === 'USD/shares'
-        ? tagObj.units['USD/shares'] || tagObj.units['USD / shares'] || []
-        : tagObj.units['USD'] || [];
-    if (!Array.isArray(unitArr)) return;
+    const { arr: unitArr, fx } = pickSecUnitsArray(tagObj, unitType);
+    if (!Array.isArray(unitArr) || unitArr.length === 0) return;
 
     for (const item of unitArr) {
       if (typeof item.val !== 'number' || !item.end) continue;
-      if (item.form !== '10-Q' && item.form !== '10-K') continue;
+      if (!ALLOWED_SEC_PERIODIC_FORMS.has(item.form)) continue;
       const spanKey = `${item.start || ''}|${item.end}`;
       const existing = bySpanKey.get(spanKey);
       const isBetter =
@@ -4243,7 +5041,7 @@ function extractStandaloneQuarterPoints(
         bySpanKey.set(spanKey, {
           end: item.end,
           start: item.start,
-          val: item.val,
+          val: Number((item.val * fx).toFixed(2)),
           fy: item.fy,
           fp: item.fp,
           form: item.form,
@@ -4251,63 +5049,60 @@ function extractStandaloneQuarterPoints(
           accn: item.accn,
           frame: item.frame,
           priority: tagIdx,
+          periodDays: daysBetween(item.start, item.end),
         });
       }
     }
   });
 
   const allPoints = Array.from(bySpanKey.values());
-  const standaloneByEnd = new Map<string, XbrlQuarterPoint>();
+  const standaloneByEnd = new Map<string, XbrlQuarterPoint & { periodDays?: number }>();
 
   // 1. Direct standalone 3-month entries (~70-115 days duration)
   for (const pt of allPoints) {
-    const dur = daysBetween(pt.start, pt.end);
+    const dur = pt.periodDays ?? daysBetween(pt.start, pt.end);
     const isStandaloneQFrame = typeof pt.frame === 'string' && /^CY\d{4}Q[1-4]$/.test(pt.frame);
     if ((dur >= 70 && dur <= 115) || isStandaloneQFrame) {
       const existing = standaloneByEnd.get(pt.end);
-      if (
-        !existing ||
-        (pt.filed || '') > (existing.filed || '')
-      ) {
-        standaloneByEnd.set(pt.end, pt);
+      if (!existing || (pt.filed || '') > (existing.filed || '')) {
+        standaloneByEnd.set(pt.end, { ...pt, periodDays: dur > 0 ? dur : 91 });
       }
     }
   }
 
-  // 2. Group cumulative YTD series by fiscal year start date so we derive Q2 = 6M - 3M, Q3 = 9M - 6M, Q4 = 12M - 9M
-  const ytdByStart = new Map<string, XbrlQuarterPoint[]>();
+  // 2. Group cumulative YTD series by fiscal year start date (Q2=6M-3M, Q3=9M-6M, Q4=12M-9M)
+  const ytdByStart = new Map<string, Array<XbrlQuarterPoint & { periodDays: number }>>();
   for (const pt of allPoints) {
     if (!pt.start) continue;
-    const dur = daysBetween(pt.start, pt.end);
+    const dur = pt.periodDays ?? daysBetween(pt.start, pt.end);
     if (dur >= 70 && dur <= 390) {
       const arr = ytdByStart.get(pt.start) || [];
-      arr.push(pt);
+      arr.push({ ...pt, periodDays: dur });
       ytdByStart.set(pt.start, arr);
     }
   }
 
   for (const [, pts] of ytdByStart.entries()) {
-    // Sort chronologically ascending by end date (3M -> 6M -> 9M -> 12M)
     const sortedAsc = [...pts].sort((a, b) => a.end.localeCompare(b.end));
     for (let i = 0; i < sortedAsc.length; i++) {
       const curr = sortedAsc[i];
       if (standaloneByEnd.has(curr.end)) continue;
 
-      const durCurr = daysBetween(curr.start, curr.end);
+      const durCurr = curr.periodDays;
       if (durCurr >= 70 && durCurr <= 115) {
-        standaloneByEnd.set(curr.end, curr);
+        standaloneByEnd.set(curr.end, { ...curr, periodDays: durCurr });
         continue;
       }
 
-      // Find immediate preceding cumulative period in same fiscal year (~90 days shorter)
       for (let j = i - 1; j >= 0; j--) {
         const prev = sortedAsc[j];
-        const durPrev = daysBetween(prev.start, prev.end);
+        const durPrev = prev.periodDays;
         const stepDays = durCurr - durPrev;
         if (stepDays >= 70 && stepDays <= 115) {
           standaloneByEnd.set(curr.end, {
             ...curr,
             val: Number((curr.val - prev.val).toFixed(2)),
+            periodDays: stepDays,
           });
           break;
         }
@@ -4315,15 +5110,16 @@ function extractStandaloneQuarterPoints(
     }
   }
 
-  // 3. Extra fallback for Q4 via FY Total - (Q1 + Q2 + Q3) when fiscal starts shifted slightly across years
-  const annualByFy = new Map<number, XbrlQuarterPoint>();
+  // 3. Extra fallback for Q4 via FY Total - (Q1 + Q2 + Q3)
+  const annualByFy = new Map<number, XbrlQuarterPoint & { periodDays: number }>();
   const qByFy = new Map<number, Map<string, XbrlQuarterPoint>>();
   for (const pt of allPoints) {
-    const dur = daysBetween(pt.start, pt.end);
-    if (dur >= 340 && dur <= 385 && pt.form === '10-K' && pt.fy) {
+    const dur = pt.periodDays ?? daysBetween(pt.start, pt.end);
+    const isAnnualForm = pt.form === '10-K' || pt.form === '10-K/A' || pt.form === '20-F' || pt.form === '20-F/A' || pt.form === '40-F';
+    if (dur >= 330 && dur <= 390 && isAnnualForm && pt.fy) {
       const existingFy = annualByFy.get(pt.fy);
       if (!existingFy || (pt.filed || '') > (existingFy.filed || '')) {
-        annualByFy.set(pt.fy, pt);
+        annualByFy.set(pt.fy, { ...pt, periodDays: dur });
       }
     }
   }
@@ -4344,10 +5140,32 @@ function extractStandaloneQuarterPoints(
         val: Number((annualPt.val - sum3).toFixed(2)),
         fy,
         fp: 'Q4',
-        form: '10-K',
+        form: annualPt.form,
         filed: annualPt.filed,
         accn: annualPt.accn,
+        periodDays: 91,
       });
+    }
+  }
+
+  // 4. Foreign Issuer Fallback (20-F / 40-F / 6-K semi-annual & annual filers without 3-month standalone XBRL):
+  // If fewer than 2 standalone 3-month periods exist, include semi-annual (6M: 160-205d) and full-year (12M: 330-390d) periods!
+  if (standaloneByEnd.size < 2) {
+    for (const pt of allPoints) {
+      const dur = pt.periodDays ?? daysBetween(pt.start, pt.end);
+      const isSemiAnnual = dur >= 160 && dur <= 205;
+      const isAnnual = dur >= 330 && dur <= 390;
+      if (isSemiAnnual || isAnnual) {
+        const key = `${pt.end}|${isAnnual ? 'FY' : 'H'}`;
+        const existing = standaloneByEnd.get(key);
+        if (!existing || (pt.filed || '') > (existing.filed || '')) {
+          standaloneByEnd.set(key, {
+            ...pt,
+            fp: isAnnual ? 'FY' : 'H1',
+            periodDays: dur,
+          });
+        }
+      }
     }
   }
 
@@ -4361,17 +5179,30 @@ function extractInstantPointNearDate(
 ): number | null {
   const usGaap = factsRoot?.facts?.['us-gaap'] || {};
   const ifrs = factsRoot?.facts?.['ifrs-full'] || {};
+  const targetMs = new Date(targetEnd).getTime();
 
   for (const tag of tagCandidates) {
     const tagObj = usGaap[tag] || ifrs[tag];
-    const usdArr: any[] = tagObj?.units?.['USD'] || [];
+    const { arr: usdArr, fx } = pickSecUnitsArray(tagObj, 'USD');
     if (!Array.isArray(usdArr) || usdArr.length === 0) continue;
 
     // Exact match on end date first
-    const matches = usdArr.filter((x) => x.end === targetEnd && typeof x.val === 'number');
-    if (matches.length > 0) {
-      matches.sort((a, b) => String(b.filed || '').localeCompare(String(a.filed || '')));
-      return matches[0].val;
+    const exactMatches = usdArr.filter((x) => x.end === targetEnd && typeof x.val === 'number');
+    if (exactMatches.length > 0) {
+      exactMatches.sort((a, b) => String(b.filed || '').localeCompare(String(a.filed || '')));
+      return Number((exactMatches[0].val * fx).toFixed(2));
+    }
+
+    // Closest balance-sheet instant within 7 days (handles 52/53-week fiscal end date shifts)
+    const nearMatches = usdArr
+      .filter((x) => {
+        if (typeof x.val !== 'number' || !x.end) return false;
+        const diffDays = Math.abs(new Date(x.end).getTime() - targetMs) / (1000 * 60 * 60 * 24);
+        return diffDays <= 7;
+      })
+      .sort((a, b) => String(b.filed || '').localeCompare(String(a.filed || '')));
+    if (nearMatches.length > 0) {
+      return Number((nearMatches[0].val * fx).toFixed(2));
     }
   }
   return null;
@@ -4424,7 +5255,7 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
   const subJson: any = await subResp.json();
   const factsJson: any = await factsResp.json();
 
-  // Build official recent 10-Q, 10-K, 8-K filings list
+  // Build official recent 10-Q, 10-K, 20-F, 40-F, 6-K, 8-K filings list
   const recent = subJson?.filings?.recent || {};
   const forms: string[] = recent.form || [];
   const filingDates: string[] = recent.filingDate || [];
@@ -4433,10 +5264,19 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
   const primaryDocuments: string[] = recent.primaryDocument || [];
   const primaryDescriptions: string[] = recent.primaryDocDescription || [];
 
+  const ALLOWED_FILING_LIST_FORMS = new Set([
+    '10-Q', '10-Q/A', '10-K', '10-K/A', '8-K',
+    '20-F', '20-F/A', '40-F', '40-F/A', '6-K', '6-K/A',
+  ]);
+  const PERIODIC_REPORT_FORMS = new Set([
+    '10-Q', '10-Q/A', '10-K', '10-K/A',
+    '20-F', '20-F/A', '40-F', '40-F/A', '6-K', '6-K/A',
+  ]);
+
   const officialFilings: any[] = [];
-  for (let i = 0; i < forms.length && officialFilings.length < 24; i++) {
+  for (let i = 0; i < forms.length && officialFilings.length < 28; i++) {
     const f = forms[i];
-    if (f === '10-Q' || f === '10-K' || f === '8-K') {
+    if (ALLOWED_FILING_LIST_FORMS.has(f)) {
       const acc = accessionNumbers[i] || '';
       const accNoDashes = acc.replace(/-/g, '');
       const doc = primaryDocuments[i] || '';
@@ -4454,45 +5294,62 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
     }
   }
 
-  // Extract core financial series from SEC XBRL
+  // Extract core financial series from SEC XBRL (US-GAAP + IFRS tags)
   const revSeries = extractStandaloneQuarterPoints(factsJson, [
-    'RevenueFromContractWithCustomerExcludingAssessedTax',
+    'RevenuesNetOfInterestExpense',
     'Revenues',
+    'TotalRevenuesAndOtherIncome',
     'SalesRevenueNet',
+    'RevenueFromContractWithCustomerExcludingAssessedTax',
     'RevenueFromContractWithCustomerIncludingAssessedTax',
     'SalesRevenueServicesNet',
-    'RevenuesNetOfInterestExpense',
     'InterestAndDividendIncomeOperating',
+    'RealEstateRevenueNet',
+    'Revenue',
+    'RevenueFromContractsWithCustomers',
   ]);
   const grossSeries = extractStandaloneQuarterPoints(factsJson, ['GrossProfit']);
   const costRevSeries = extractStandaloneQuarterPoints(factsJson, [
     'CostOfRevenue',
     'CostOfGoodsAndServicesSold',
     'CostOfGoodsSold',
+    'CostOfSales',
   ]);
   const opIncSeries = extractStandaloneQuarterPoints(factsJson, [
     'OperatingIncomeLoss',
+    'ProfitLossFromOperatingActivities',
     'IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest',
   ]);
-  const netIncSeries = extractStandaloneQuarterPoints(factsJson, ['NetIncomeLoss', 'ProfitLoss']);
+  const netIncSeries = extractStandaloneQuarterPoints(factsJson, [
+    'NetIncomeLoss',
+    'ProfitLoss',
+    'NetIncomeLossAvailableToCommonStockholdersBasic',
+  ]);
   const epsSeries = extractStandaloneQuarterPoints(
     factsJson,
-    ['EarningsPerShareDiluted', 'EarningsPerShareBasic'],
+    [
+      'EarningsPerShareDiluted',
+      'EarningsPerShareBasic',
+      'DilutedEarningsLossPerShare',
+      'BasicEarningsLossPerShare',
+    ],
     'USD/shares'
   );
   const ocfSeries = extractStandaloneQuarterPoints(factsJson, [
     'NetCashProvidedByUsedInOperatingActivities',
     'NetCashProvidedByUsedInOperatingActivitiesContinuingOperations',
+    'CashFlowsFromUsedInOperatingActivities',
   ]);
   const capexSeries = extractStandaloneQuarterPoints(factsJson, [
     'PaymentsToAcquirePropertyPlantAndEquipment',
     'PaymentsToAcquireProductiveAssets',
     'PaymentsToAcquirePropertyPlantAndEquipmentAndIntangibleAssets',
     'CapitalExpendituresIncurredButNotYetPaid',
+    'PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities',
   ]);
 
-  const toEndMap = (arr: XbrlQuarterPoint[]) => {
-    const m = new Map<string, XbrlQuarterPoint>();
+  const toEndMap = (arr: Array<XbrlQuarterPoint & { periodDays?: number }>) => {
+    const m = new Map<string, XbrlQuarterPoint & { periodDays?: number }>();
     for (const p of arr) m.set(p.end, p);
     return m;
   };
@@ -4504,7 +5361,7 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
   const ocfMap = toEndMap(ocfSeries);
   const capexMap = toEndMap(capexSeries);
 
-  // Merge unique quarter end dates from Revenue + Operating/Net Income (up to 12 most recent)
+  // Merge unique period end dates from Revenue + Operating/Net Income (up to 12 most recent)
   const dateSet = new Set<string>();
   revSeries.slice(0, 14).forEach((p) => dateSet.add(p.end));
   netIncSeries.slice(0, 14).forEach((p) => dateSet.add(p.end));
@@ -4533,31 +5390,50 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
         ? operatingCashFlow - capex
         : operatingCashFlow;
 
-    // Balance sheet at quarter end (Cash + Total Debt)
+    // Balance sheet at period end (Cash + Total Debt)
     const cash = extractInstantPointNearDate(
       factsJson,
       [
         'CashAndCashEquivalentsAtCarryingValue',
         'CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents',
+        'CashCashEquivalentsAndShortTermInvestments',
         'CashAndShortTermInvestments',
+        'CashAndCashEquivalents',
       ],
       endDate
     );
     const ltDebt =
       extractInstantPointNearDate(
         factsJson,
-        ['LongTermDebtNoncurrent', 'LongTermDebt'],
+        [
+          'LongTermDebtNoncurrent',
+          'LongTermDebt',
+          'ConvertibleLongTermNotesPayable',
+          'NoncurrentFinancialLiabilities',
+          'Borrowings',
+          'NotesPayable',
+          'UnsecuredDebt',
+          'SeniorLongTermNotes',
+          'SeniorNotes',
+          'SecuredDebt',
+          'MortgagesPayable',
+        ],
         endDate
       ) || 0;
     const stDebt =
       extractInstantPointNearDate(
         factsJson,
-        ['LongTermDebtCurrent', 'DebtCurrent', 'ShortTermBorrowings'],
+        [
+          'LongTermDebtCurrent',
+          'DebtCurrent',
+          'ShortTermBorrowings',
+          'CurrentBorrowingsAndCurrentPortionOfNoncurrentBorrowings',
+        ],
         endDate
       ) || 0;
     const totalDebtRaw = extractInstantPointNearDate(
       factsJson,
-      ['DebtAndCapitalLeaseObligations', 'LongTermDebtAndCapitalLeaseObligations'],
+      ['DebtAndCapitalLeaseObligations', 'LongTermDebtAndCapitalLeaseObligations', 'NotesPayable'],
       endDate
     );
     const totalDebt = totalDebtRaw !== null ? totalDebtRaw : (ltDebt + stDebt > 0 ? ltDebt + stDebt : null);
@@ -4575,26 +5451,48 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
         : null;
 
     const refPt = rPt || nPt;
+    const pDays = refPt?.periodDays || 91;
     const endDt = new Date(endDate);
     const calQ = Math.floor(endDt.getUTCMonth() / 3) + 1;
-    const normalizedFp = refPt?.fp === 'FY' ? 'Q4' : refPt?.fp;
-    const quarterLabel = normalizedFp && refPt?.fy
-      ? `${normalizedFp} FY${refPt.fy}`
-      : `Q${calQ} ${endDt.getUTCFullYear()}`;
 
-    // Find closest matching official filing (10-Q or 10-K)
+    // Find closest matching official periodic filing (10-Q, 10-K, 20-F, 40-F, 6-K)
     const matchingFiling =
-      officialFilings.find((f) => (f.form === '10-Q' || f.form === '10-K') && f.reportDate === endDate) ||
+      officialFilings.find((f) => PERIODIC_REPORT_FORMS.has(f.form) && f.reportDate === endDate) ||
       officialFilings.find((f) => {
-        if (f.form !== '10-Q' && f.form !== '10-K') return false;
+        if (!PERIODIC_REPORT_FORMS.has(f.form)) return false;
         const diff = Math.abs(new Date(f.reportDate).getTime() - endDt.getTime());
-        return diff <= 15 * 24 * 60 * 60 * 1000;
+        return diff <= 20 * 24 * 60 * 60 * 1000;
       });
+
+    const resolvedForm = matchingFiling?.form || refPt?.form || '10-Q';
+    let resolvedFy = refPt?.fy;
+    // If a comparative prior-year period was tagged with a later filing's FY (common in 20-F/10-K/10-Q comparative tables), adjust by filing-to-end lag
+    if (resolvedFy && refPt?.filed) {
+      const filedMs = new Date(refPt.filed).getTime();
+      const diffYears = Math.floor((filedMs - endDt.getTime()) / (320 * 24 * 60 * 60 * 1000));
+      if (diffYears >= 1 && diffYears <= 5) {
+        resolvedFy = resolvedFy - diffYears;
+      }
+    }
+    const trueEndFy = endDt.getUTCMonth() === 0 && endDt.getUTCDate() <= 7 ? endDt.getUTCFullYear() - 1 : endDt.getUTCFullYear();
+
+    let quarterLabel: string;
+    if (pDays >= 325) {
+      quarterLabel = `FY ${trueEndFy} (${resolvedForm})`;
+    } else if (pDays >= 155 && pDays <= 210) {
+      quarterLabel = `${calQ <= 2 ? 'H1' : 'H2'} ${resolvedFy || trueEndFy} (6M)`;
+    } else {
+      const normalizedFp = refPt?.fp === 'FY' ? 'Q4' : refPt?.fp;
+      quarterLabel = normalizedFp && resolvedFy
+        ? `${normalizedFp} FY${resolvedFy}`
+        : `Q${calQ} ${endDt.getUTCFullYear()}`;
+    }
 
     return {
       endDate,
       quarterLabel,
-      form: matchingFiling?.form || refPt?.form || '10-Q',
+      periodDays: pDays,
+      form: resolvedForm,
       filingDate: matchingFiling?.filingDate || refPt?.filed || '',
       secUrl: matchingFiling?.secUrl || `https://www.sec.gov/edgar/browse/?CIK=${matched!.cik}`,
       revenue,
@@ -4617,12 +5515,13 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
     };
   });
 
-  // Compute YoY Growth for each quarter vs 4 quarters prior (index + 4 or closest ~365 days prior)
-  const quarters = rawQuarters.slice(0, 8).map((q, idx) => {
+  // Compute YoY Growth comparing matching period durations (~365 days prior)
+  const quarters = rawQuarters.slice(0, 8).map((q) => {
     const targetMs = new Date(q.endDate).getTime() - 365 * 24 * 60 * 60 * 1000;
     const priorYearQ = rawQuarters.find((cand) => {
       const diffDays = Math.abs(new Date(cand.endDate).getTime() - targetMs) / (1000 * 60 * 60 * 24);
-      return diffDays <= 40;
+      const durDiff = Math.abs((q.periodDays || 91) - (cand.periodDays || 91));
+      return diffDays <= 45 && durDiff <= 45;
     });
 
     const calcPct = (curr: number | null, prev: number | null) => {
@@ -4643,6 +5542,7 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
   });
 
   const latest = quarters[0];
+  const latestAnnFactor = latest ? ((latest.periodDays || 91) >= 320 ? 1 : (latest.periodDays || 91) >= 155 ? 2 : 4) : 4;
   const latestChecks = latest
     ? {
         revenueGrowing: latest.revenueYoY !== null ? latest.revenueYoY > 0 : (latest.revenue || 0) > 0,
@@ -4655,7 +5555,7 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
           latest.netDebt !== null
             ? latest.netDebt <= 0 ||
               (latest.operatingIncome && latest.operatingIncome > 0
-                ? latest.netDebt / (latest.operatingIncome * 4) < 3.0
+                ? latest.netDebt / (latest.operatingIncome * latestAnnFactor) < 3.0
                 : true)
             : true,
       }

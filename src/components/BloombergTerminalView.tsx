@@ -227,7 +227,10 @@ export const BloombergTerminalView: React.FC<BloombergTerminalViewProps> = ({
                 ticker={stock.ticker}
                 companyName={stock.companyName}
                 currentPrice={stock.currentPrice}
-                livePriceInfo={liveInfo}
+                expected5YCAGR={stock.expected5YCAGRRange}
+                liveTickPrice={liveInfo?.price}
+                liveChangePercent={liveInfo?.changePercent}
+                currentLang={currentLang}
               />
             </div>
           </div>

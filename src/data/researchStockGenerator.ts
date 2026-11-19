@@ -520,7 +520,7 @@ export const KNOWN_CATALOG_PRICES: Record<string, number> = {
   WBA: 10.40,
   WBD: 30.95,
   WDAY: 178.32,
-  WDC: 288.93,
+  WDC: 299.97,
   WEC: 117.15,
   WELL: 246.84,
   WFC: 81.53,
