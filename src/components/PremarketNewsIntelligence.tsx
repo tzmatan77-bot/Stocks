@@ -788,6 +788,11 @@ export const PremarketNewsIntelligence: React.FC<PremarketNewsIntelligenceProps>
                         >
                           {item.ticker}
                         </button>
+                        {item.ticker === 'SPY' && (
+                          <span className="text-[11px] font-medium text-cyan-300">
+                            {isHe ? 'מדד S&P 500 · חדשות מאקרו' : 'S&P 500 Index · Macro'}
+                          </span>
+                        )}
                         <span className="text-xs text-slate-400 truncate max-w-[200px] sm:max-w-[280px]">
                           {item.companyName}
                         </span>
@@ -876,7 +881,9 @@ export const PremarketNewsIntelligence: React.FC<PremarketNewsIntelligenceProps>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs sm:text-sm">
                     <div className="space-y-1">
                       <div className="text-xs font-semibold text-slate-400">
-                        {isHe ? 'למה המניה מגיבה ככה?' : 'Why is the stock reacting?'}
+                        {item.ticker === 'SPY'
+                          ? isHe ? 'למה השוק והמדד מגיבים ככה?' : 'Why is the market reacting?'
+                          : isHe ? 'למה המניה מגיבה ככה?' : 'Why is the stock reacting?'}
                       </div>
                       <p className="text-slate-200 leading-relaxed">{whyText}</p>
                     </div>

@@ -1069,14 +1069,19 @@ function buildContextualReactionAnalysis(params: {
       ? 'POSITIVE_UP'
       : 'MIXED_VOLATILE');
 
+  const isSpyMacro = ticker === 'SPY';
   const expectedReactionLabelHe =
     expectedReaction === 'POSITIVE_UP'
       ? hasLiveChg && liveChangePercent! > 0.3
-        ? `תגובה חיובית (המניה עולה ${liveChgStr})`
+        ? isSpyMacro
+          ? `תגובה חיובית (מדד S&P 500 עולה ${liveChgStr})`
+          : `תגובה חיובית (המניה עולה ${liveChgStr})`
         : 'צפי לתגובה חיובית (נטייה לעליות)'
       : expectedReaction === 'NEGATIVE_DOWN'
       ? hasLiveChg && liveChangePercent! < -0.3
-        ? `תגובת לחץ (המניה יורדת ${liveChgStr})`
+        ? isSpyMacro
+          ? `תגובת לחץ (מדד S&P 500 יורד ${liveChgStr})`
+          : `תגובת לחץ (המניה יורדת ${liveChgStr})`
         : 'צפי לתגובת לחץ (נטייה לירידות)'
       : 'תגובה מעורבת / תנודתיות נקודתית';
 
@@ -1089,14 +1094,24 @@ function buildContextualReactionAnalysis(params: {
 
   const expectedMoveRange =
     aiOverride?.expectedMoveRange ||
-    (expectedReaction === 'POSITIVE_UP' ? '+2% עד +6%' : expectedReaction === 'NEGATIVE_DOWN' ? '-2% עד -7%' : '±1.5%');
+    (isSpyMacro
+      ? expectedReaction === 'POSITIVE_UP'
+        ? '+0.5% עד +1.8%'
+        : expectedReaction === 'NEGATIVE_DOWN'
+        ? '-0.5% עד -2.0%'
+        : '±0.8%'
+      : expectedReaction === 'POSITIVE_UP'
+      ? '+2% עד +6%'
+      : expectedReaction === 'NEGATIVE_DOWN'
+      ? '-2% עד -7%'
+      : '±1.5%');
 
   let defaultWhyHe = '';
   let defaultOverreactionHe = '';
   let defaultRespondHe = '';
 
   if (/fed|rate hike|interest rate|inflation|cpi|pce|waller|powell|fomc|treasury/.test(lower)) {
-    defaultWhyHe = `איתותי הריבית והמאקרו של הפדרל ריזרב (${source}) משפיעים ישירות על עלויות המימון ומכפילי התמחור של מניות הצמיחה והשוק כולו.`;
+    defaultWhyHe = `איתותי הריבית והמאקרו של הפדרל ריזרב (${source}) משפיעים ישירות על עלויות המימון ומכפילי התמחור של השוק כולו (מדד S&P 500 / SPY).`;
     defaultOverreactionHe = 'תנודות ראשוניות סביב הצהרות בכירי הפד נוטות להירגע תוך 24-48 שעות כשהשוק בוחן את הנתונים הכלכליים בפועל.';
     defaultRespondHe = 'לשמור על משמעת תיק, להימנע ממכירות בהלה ולהתמקד בחברות בעלות מאזן חזק וחוב נמוך.';
   } else if (/resign|step.*down|depart|ouster|scandal|uncertainty|without jensen/.test(lower)) {
@@ -1104,21 +1119,35 @@ function buildContextualReactionAnalysis(params: {
     defaultOverreactionHe = 'בטווח של ימים ראשונים השוק נוטה להגיב בתנודתיות יתר לכותרות אישיות; המבחן האמיתי הוא המשך הצמיחה בהזמנות וברווחים.';
     defaultRespondHe = 'לא למהר לקנות או למכור בבהלה — להמתין להתייצבות המחיר ולעקוב אחר הודעות רשמיות מההנהלה.';
   } else if (catalystType === 'EARNINGS_BEAT' || /beat|surge|soar|record|strong.*sales|raises? guidance|raises? outlook|hikes guidance/.test(lower)) {
-    defaultWhyHe = `הדיווח מצביע על תוצאות חזקות מהצפוי או העלאת תחזית (Guidance) ב-${ticker}, מה שדוחף משקיעים לתמחר צמיחה גבוהה יותר ברווחים.`;
+    defaultWhyHe = isSpyMacro
+      ? `הדיווח משקף אופטימיות רחבה בנתוני המאקרו או רווחי החברות במדד S&P 500 (SPY), מה שדוחף את המדדים לעליות.`
+      : `הדיווח מצביע על תוצאות חזקות מהצפוי או העלאת תחזית (Guidance) ב-${ticker}, מה שדוחף משקיעים לתמחר צמיחה גבוהה יותר ברווחים.`;
     defaultOverreactionHe = 'כאשר העלייה מגובה בדוחות כספיים או בהעלאת תחזית הנהלה, לרוב מדובר במומנטום עסקי מבוסס ולא ברעש חולף.';
     defaultRespondHe = 'למשקיעים קיימים: להמשיך להחזיק. למצטרפים חדשים: להימנע ממרדף אחרי קפיצה חדה ולחכות לנסיגה קלה לטווח כניסה נוח.';
-  } else if (catalystType === 'GUIDANCE_CUT' || /miss|cut|slash|warn|probe|lawsuit|downgrade|tariff|recall|cyber|risk|urges caution/.test(lower)) {
-    defaultWhyHe = `המשקיעים מתמחרים סיכון לפגיעה בקצב הצמיחה, בביקושים או ברווחיות של ${ticker} בעקבות אזהרה, סיכון רגולטורי או זהירות אנליסטים (${source}).`;
+  } else if (catalystType === 'GUIDANCE_CUT' || /miss|cut|slash|warn|probe|lawsuit|downgrade|tariff|recall|cyber|risk|urges caution|sell-?off|drop|decline/.test(lower)) {
+    defaultWhyHe = isSpyMacro
+      ? `הידיעה ב-${source} מצביעה על חשש מאקרו-כלכלי או סנטימנט זהיר בוול סטריט המשפיע על מדד S&P 500 (SPY)${hasLiveChg ? ` (המדד נע כעת ב-${liveChgStr})` : ''}.`
+      : `המשקיעים מתמחרים סיכון לפגיעה בקצב הצמיחה, בביקושים או ברווחיות של ${ticker} בעקבות אזהרה, סיכון רגולטורי או זהירות אנליסטים (${source}).`;
     defaultOverreactionHe = knownMoatHe
       ? `חשוב לבחון אם זו כותרת קצרת טווח או פגיעה ביתרון המרכזי של החברה: ${knownMoatHe}`
+      : isSpyMacro
+      ? 'תנודות מאקרו יומיות נובעות לרוב מרוטציה או חששות קצרי טווח; בטווח הבינוני כיוון המדד נקבע לפי צמיחת הרווחים של החברות המובילות והריבית.'
       : 'אם תחזית הרווח לשנה הקרובה ירדה ממשית — הלחץ עלול להימשך מספר ימים; אם זו פרשנות זהירה בלבד, ייתכן שמדובר בתגובת יתר.';
-    defaultRespondHe = 'מומלץ להמתין להתייצבות מחזורי המסחר ולא למהר להגדיל חשיפה לפני שמתבררת ההשפעה הכספית.';
+    defaultRespondHe = isSpyMacro
+      ? 'לשמור על איזון בתיק ולא לפעול מתוך פאניקה יומית; לבחון איסוף הדרגתי במניות איכות שנחלשות שלא בצדק.'
+      : 'מומלץ להמתין להתייצבות מחזורי המסחר ולא למהר להגדיל חשיפה לפני שמתבררת ההשפעה הכספית.';
   } else if (/upgrade|overweight|buy rating|top pick|price target|breakout|approv|investment|deal|contract|partnership/.test(lower)) {
-    defaultWhyHe = `דיווח חיובי ב-${source} על שדרוג אנליסטים, אישור מוצר או השקעה אסטרטגית של ${ticker} מחזק את הצפי לצמיחת ההכנסות.`;
+    defaultWhyHe = isSpyMacro
+      ? `דיווח חיובי ב-${source} מחזק את סנטימנט המשקיעים כלפי מדד S&P 500 (SPY) ותומך בזרימת כספים למניות המובילות.`
+      : `דיווח חיובי ב-${source} על שדרוג אנליסטים, אישור מוצר או השקעה אסטרטגית של ${ticker} מחזק את הצפי לצמיחת ההכנסות.`;
     defaultOverreactionHe = 'התגובה תיבחן לפי היקף התרומה הישירה להכנסות ולרווח התפעולי ברבעונים הקרובים.';
-    defaultRespondHe = 'לעקוב אחר המומנטום ולבדוק התאמה לרמת השווי ההוגן של המניה בתיק.';
+    defaultRespondHe = isSpyMacro
+      ? 'להמשיך בפיזור מבוקר במדד ובמניות הליבה ללא שינוי אסטרטגי חפוז.'
+      : 'לעקוב אחר המומנטום ולבדוק התאמה לרמת השווי ההוגן של המניה בתיק.';
   } else {
-    defaultWhyHe = `הדיווח היומי ב-${source} מרכז עניין סביב ${ticker}${hasLiveChg ? ` והמניה נעה כעת ב-${liveChgStr}` : ''}, כאשר השוק מעכל את ההשפעה העסקית לימים הקרובים.`;
+    defaultWhyHe = isSpyMacro
+      ? `הדיווח היומי ב-${source} מתייחס למגמת השוק הרחבה ולמדד S&P 500 (תעודת הסל SPY)${hasLiveChg ? ` — המדד נע כעת ב-${liveChgStr}` : ''}.`
+      : `הדיווח היומי ב-${source} מרכז עניין סביב ${ticker}${hasLiveChg ? ` והמניה נעה כעת ב-${liveChgStr}` : ''}, כאשר השוק מעכל את ההשפעה העסקית לימים הקרובים.`;
     defaultOverreactionHe = 'בשעות הראשונות התגובה משקפת בעיקר סנטימנט של כותרות; ההשפעה האמיתית תימדד לפי שינוי בתזרים וברווחיות.';
     defaultRespondHe = 'להתעדכן בפרטי הכתבה, לוודא שאין שינוי מהותי בתזת ההשקעה ולהימנע מפעולה חפוזה.';
   }
@@ -1191,7 +1220,7 @@ const TICKER_COMPANY_PATTERNS: { ticker: string; name: string; titleRegex: RegEx
   { ticker: 'HOOD', name: 'Robinhood Markets, Inc.', titleRegex: /\b(robinhood|\bhood\b.*\b(stock|shares|earnings|crypto))\b/i, queryHint: 'Robinhood stock' },
   { ticker: 'SOFI', name: 'SoFi Technologies, Inc.', titleRegex: /\b(sofi)\b/i, queryHint: 'SoFi stock' },
   { ticker: 'PYPL', name: 'PayPal Holdings, Inc.', titleRegex: /\b(paypal|pypl)\b/i, queryHint: 'PayPal OR PYPL' },
-  { ticker: 'V', name: 'Visa Inc.', titleRegex: /\b(visa['’]?s|\bvisa\b.*\b(stock|shares|earnings|payment|shopping|cmo|cyber|card)|\(nyse:v\))\b/i, queryHint: '"Visa" stock' },
+  { ticker: 'V', name: 'Visa Inc.', titleRegex: /\b(visa['’]?s|\bvisa\b.*\b(stock|shares|earnings|payments?|shopping|cmo|cyber|card|network|agent)|\(nyse:v\))\b/i, queryHint: '"Visa" stock' },
   { ticker: 'MA', name: 'Mastercard Incorporated', titleRegex: /\b(mastercard|\(nyse:ma\))\b/i, queryHint: 'Mastercard stock' },
   { ticker: 'JPM', name: 'JPMorgan Chase & Co.', titleRegex: /\b(jpmorgan|jp morgan|j\.p\. morgan|\bjpm\b)\b/i, queryHint: 'JPMorgan OR JPM' },
   { ticker: 'GS', name: 'The Goldman Sachs Group, Inc.', titleRegex: /\b(goldman sachs)\b/i, queryHint: '"Goldman Sachs"' },
@@ -1199,7 +1228,7 @@ const TICKER_COMPANY_PATTERNS: { ticker: string; name: string; titleRegex: RegEx
   { ticker: 'BLK', name: 'BlackRock, Inc.', titleRegex: /\b(blackrock|\bblk\b)\b/i, queryHint: 'BlackRock' },
   { ticker: 'BRK.B', name: 'Berkshire Hathaway Inc.', titleRegex: /\b(berkshire hathaway|buffett|brk\.b)\b/i, queryHint: '"Berkshire Hathaway"' },
   { ticker: 'WMT', name: 'Walmart Inc.', titleRegex: /\b(walmart|wmt)\b/i, queryHint: 'Walmart OR WMT' },
-  { ticker: 'TGT', name: 'Target Corporation', titleRegex: /\b(target['’]?s|\btarget shares\b|\btarget corp|\(nyse:tgt\)|\btgt\b.*\b(earnings|sales|guidance))\b/i, queryHint: '"Target Corporation" OR "Target shares"' },
+  { ticker: 'TGT', name: 'Target Corporation', titleRegex: /\b(target['’]s|\btarget shares\b|\btarget corp\.?|\btarget corporation\b|\btarget stock\b|\(nyse:tgt\)|\btgt\b.*\b(stock|shares|earnings|sales|guidance))\b/i, queryHint: '"Target Corporation" OR "Target shares"' },
   { ticker: 'LOW', name: "Lowe's Companies, Inc.", titleRegex: /\b(lowe['’]s|\(nyse:low\))\b/i, queryHint: '"Lowe\'s" stock' },
   { ticker: 'HD', name: 'The Home Depot, Inc.', titleRegex: /\b(home depot|\(nyse:hd\))\b/i, queryHint: '"Home Depot"' },
   { ticker: 'COST', name: 'Costco Wholesale Corporation', titleRegex: /\b(costco|\bcost\b.*\b(stock|shares|earnings|sales))\b/i, queryHint: 'Costco' },
@@ -1376,22 +1405,25 @@ function formatDeterministicHebrewNews(params: {
     .replace(new RegExp(`\\s*[-–|]?\\s*${escapedSource}(?:\\.com)?\\s*$`, 'i'), '')
     .trim();
   const lower = cleanTitle.toLowerCase();
-  const companyLabel = ticker === 'SPY' ? 'וול סטריט והפד' : `${companyName.replace(/,?\s*(Inc\.?|Corp\.?|Corporation|Ltd\.?|Limited|Holdings|Group|plc).*$/i, '').trim()} (${ticker})`;
+  const companyLabel =
+    ticker === 'SPY'
+      ? 'מדד S&P 500 • מאקרו וול סטריט (SPY)'
+      : `${companyName.replace(/,?\s*(Inc\.?|Corp\.?|Corporation|Ltd\.?|Limited|Holdings|Group|plc).*$/i, '').trim()} (${ticker})`;
   const emoji = sentiment === 'BEARISH' ? '🔴' : sentiment === 'BULLISH' ? '🟢' : '🔵';
 
   // Specific high-frequency market & macro event patterns translated naturally to Hebrew
   if (ticker === 'SPY' && /(waller|fed|federal reserve|fomc|powell)/.test(lower) && /(rate hike|half-point|rates|minutes|inflation|next moves)/.test(lower)) {
     const isHalfPoint = /half-point|50\s*bps|shock/i.test(lower);
     const headlineHe = isHalfPoint
-      ? `🔴 וול סטריט וריבית (${sourceName}): בכיר הפד מאותת כי הבנק המרכזי עשוי להפתיע בהעלאת ריבית של 0.5%`
-      : `🔴 מאקרו והפדרל ריזרב (${sourceName}): המתיחות סביב פרוטוקול הפד ותוואי הריבית מכבידה על המדדים`;
+      ? `🔴 מדד S&P 500 • מאקרו (SPY • ${sourceName}): בכיר הפד מאותת כי הבנק המרכזי עשוי להפתיע בהעלאת ריבית של 0.5%`
+      : `🔴 מדד S&P 500 • מאקרו (SPY • ${sourceName}): המתיחות סביב פרוטוקול הפד ותוואי הריבית מכבידה על המדדים`;
     const summaryHe = isHalfPoint
-      ? `חבר מועצת הפדרל ריזרב כריסטופר וולר הזהיר כי המשך האינפלציה עשוי לחייב צעד חד של העלאת ריבית בחצי אחוז, מה שמייצר זהירות בשוקי המניות והאג"ח.`
-      : `פרוטוקול החלטת הריבית של הפד והציפיות לצעדי הבנק המרכזי מרכזים עניין בוול סטריט ומעיבים על סנטימנט המשקיעים (${cleanTitle}).`;
+      ? `חבר מועצת הפדרל ריזרב כריסטופר וולר הזהיר כי המשך האינפלציה עשוי לחייב צעד חד של העלאת ריבית בחצי אחוז, מה שמייצר זהירות בשוקי המניות והאג"ח (${cleanTitle}).`
+      : `פרוטוקול החלטת הריבית של הפד והציפיות לצעדי הבנק המרכזי מרכזים עניין בוול סטריט ומעיבים על סנטימנט השוק (${cleanTitle}).`;
     return { headlineHe, summaryHe };
   }
 
-  if (/jensen|huang/.test(lower) && /without jensen|resignation|uncertainty|come.?back|without/.test(lower)) {
+  if (/jensen|huang/.test(lower) && /without jensen|resignation|uncertainty|come.?back/.test(lower)) {
     const isScandalTimeline = /timeline|scandal|potential comeback/i.test(lower);
     const isUncertainty = /uncertainty|who and what comes next|caution|without jensen/i.test(lower);
     const headlineHe = isScandalTimeline
@@ -1403,14 +1435,14 @@ function formatDeterministicHebrewNews(params: {
     return { headlineHe, summaryHe };
   }
 
-  if (/anthropic/.test(lower) && /nvidia|\$10\s*billion/i.test(lower)) {
+  if (/anthropic/.test(lower) && /nvidia/i.test(lower) && /\$10\s*billion|invest|plan/i.test(lower)) {
     return {
       headlineHe: `🟢 אנבידיה (NVDA • ${sourceName}): השקעה מתוכננת של 10 מיליארד דולר ב-Anthropic מעמיקה את האחיזה ב-AI`,
       summaryHe: `אנבידיה מקדמת השקעה אסטרטגית של כ-10 מיליארד דולר בחברת הבינה המלאכותית Anthropic, מה שמחזק את הביקוש העתידי לתשתיות המחשוב והשבבים שלה.`,
     };
   }
 
-  if (/anthropic/.test(lower) && /(amazon|alphabet|google)/i.test(lower)) {
+  if (/anthropic/.test(lower) && /(amazon|alphabet|google)/i.test(lower) && /(28%|stake|ipo|hold|own)/i.test(lower)) {
     return {
       headlineHe: `🟢 אמזון ואלפאבית (${ticker} • ${sourceName}): צפויות להחזיק מעל 28% מ-Anthropic לאחר ההנפקה`,
       summaryHe: `דיווח מרכז עניין מוסדי לקראת הנפקתה הצפויה של Anthropic: האחזקות האסטרטגיות של אמזון (AMZN) וגוגל (GOOGL) עשויות להניב רווח הוני משמעותי וביקושי ענן מתמשכים.`,
@@ -1418,19 +1450,23 @@ function formatDeterministicHebrewNews(params: {
   }
 
   if (sentiment === 'BULLISH' || /(rises?|surges?|jumps?|climbs?|soars?|beats?|hikes? guidance|raises? outlook|strong.*sales)/.test(lower)) {
-    const headlineHe = `🟢 ${companyLabel} (${sourceName}): עליות ורוח גבית בעקבות תוצאות חזקות, שת"פ או העלאת תחזית`;
-    const summaryHe = `לפי דיווח ב-${sourceName} (${dateLabel} • ${timeLabel}): ${cleanTitle}. המשקיעים מגיבים לשיפור במומנטום ההכנסות והעסקים הצפוי.`;
+    const headlineHe = ticker === 'SPY'
+      ? `🟢 ${companyLabel} (${sourceName}): עליות ורוח גבית במדדים — ${cleanTitle}`
+      : `🟢 ${companyLabel} (${sourceName}): מומנטום חיובי — ${cleanTitle}`;
+    const summaryHe = `לפי דיווח ב-${sourceName} (${dateLabel} • ${timeLabel}): ${cleanTitle}. המשקיעים מגיבים לשיפור במומנטום והציפיות בשוק.`;
     return { headlineHe, summaryHe };
   }
 
-  if (sentiment === 'BEARISH' || /(downgrade|slumps?|plunges?|falls?|drops?|down \d+|sinks?|sputters?|drag down|caution|warning|probe|antitrust|at risk|anti-fraud|hooks? teens)/.test(lower)) {
-    const headlineHe = `🔴 ${companyLabel} (${sourceName}): זהירות ולחץ בעקבות אזהרת סיכון, ביקורת רגולטורית או חולשה`;
-    const summaryHe = `דיווח ב-${sourceName} (${dateLabel} • ${timeLabel}) מצביע על אתגר או זהירות בשוק סביב ${companyLabel}: ${cleanTitle}.`;
+  if (sentiment === 'BEARISH' || /(downgrade|slumps?|plunges?|falls?|drops?|down \d+|sinks?|sputters?|drag down|caution|warning|probe|antitrust|at risk|anti-fraud|hooks? teens|sell-?off|decline)/.test(lower)) {
+    const headlineHe = ticker === 'SPY'
+      ? `🔴 ${companyLabel} (${sourceName}): זהירות ולחץ בשוק — ${cleanTitle}`
+      : `🔴 ${companyLabel} (${sourceName}): זהירות ולחץ — ${cleanTitle}`;
+    const summaryHe = `דיווח ב-${sourceName} (${dateLabel} • ${timeLabel}) מצביע על זהירות או מימושים סביב ${companyLabel}: ${cleanTitle}.`;
     return { headlineHe, summaryHe };
   }
 
   if (/(approves?|approval|fedramp|malware|blocked|breakout|ai agents|marketing|expand|investment|deal|azure|sase|earnings:\s*revenue estimate)/.test(lower)) {
-    const headlineHe = `${emoji} ${companyLabel} (${sourceName}): עדכון עסקי, אישור מוצר או התפתחות אסטרטגית`;
+    const headlineHe = `${emoji} ${companyLabel} (${sourceName}): התפתחות עסקית — ${cleanTitle}`;
     const summaryHe = `עדכון שוטף מ-${sourceName} (${dateLabel} • ${timeLabel}) על פעילות ${companyLabel}: ${cleanTitle}.`;
     return { headlineHe, summaryHe };
   }
@@ -1509,8 +1545,16 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
 
         const rawTitle = titleMatch ? cleanHtmlSnippet(titleMatch[1]) : '';
         if (!rawTitle) continue;
-        const normKey = rawTitle.toLowerCase().replace(/\s*[-–|]\s*[^-–|]+$/, '').trim();
-        if (seenTitles.has(normKey)) continue;
+        const normFull = rawTitle
+          .replace(/[’‘]/g, "'")
+          .replace(/[“”]/g, '"')
+          .toLowerCase()
+          .replace(/\s*[-–|]\s*[^-–|]+$/, '')
+          .replace(/[^a-z0-9\s]/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        const normKey = normFull.slice(0, 56);
+        if (seenTitles.has(normFull) || (normKey.length >= 28 && seenTitles.has(normKey))) continue;
 
         const rawSource = sourceMatch ? cleanHtmlSnippet(sourceMatch[1]) : defaultSourceFromUrl(rssUrls[urlIdx]);
         const snippet = descMatch ? cleanHtmlSnippet(descMatch[1]) : rawTitle;
@@ -1527,7 +1571,8 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
         const timing = formatRssPublishedTime(pubDate);
         if (!timing || timing.ageHours > 72) continue;
 
-        seenTitles.add(normKey);
+        seenTitles.add(normFull);
+        if (normKey.length >= 28) seenTitles.add(normKey);
         const link = linkMatch ? cleanHtmlSnippet(linkMatch[1]) : 'https://finance.yahoo.com';
 
         rawItems.push({
@@ -1564,7 +1609,7 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
     const freshestItems: typeof rawItems = [];
     for (const s of scoredItems) {
       const t = s.it.ticker;
-      const cap = t === 'SPY' ? 3 : 2;
+      const cap = 2;
       const count = tickerCapMap.get(t) || 0;
       if (count >= cap) continue;
       tickerCapMap.set(t, count + 1);
@@ -1581,11 +1626,14 @@ async function refreshLiveRssBreakingNews(force: boolean = false): Promise<void>
       const isBear = sentiment === 'BEARISH';
       const isBull = sentiment === 'BULLISH';
       const knownInfo = GLOBAL_STOCK_KNOWLEDGE[ticker];
-      const companyName = knownInfo?.name || KNOWN_COMPANY_NAME_MAP[ticker] || (ticker === 'SPY' ? 'מדד S&P 500 ומאקרו' : `${ticker} Corp.`);
+      const companyName =
+        ticker === 'SPY'
+          ? 'מדד S&P 500 (תעודת סל SPY · מאקרו)'
+          : knownInfo?.name || KNOWN_COMPANY_NAME_MAP[ticker] || `${ticker} Corp.`;
 
-      const fallbackPrice = KNOWN_CATALOG_PRICES[ticker] || 150.0;
-      const targetPrice = Number((fallbackPrice * (isBear ? 1.06 : 1.18)).toFixed(2));
-      const buyZoneMax = Number((fallbackPrice * (isBear ? 0.94 : 1.02)).toFixed(2));
+      const fallbackPrice = KNOWN_CATALOG_PRICES[ticker] || (ticker === 'SPY' ? 715.0 : 150.0);
+      const targetPrice = Number((fallbackPrice * (ticker === 'SPY' ? (isBear ? 1.03 : 1.09) : isBear ? 1.06 : 1.18)).toFixed(2));
+      const buyZoneMax = Number((fallbackPrice * (ticker === 'SPY' ? (isBear ? 0.96 : 1.0) : isBear ? 0.94 : 1.02)).toFixed(2));
 
       const cacheKey = `${todayKey}:${ticker}:${raw.title.slice(0, 80)}`;
       const cachedAi = dailyAiNewsCache.get(cacheKey);
@@ -1778,6 +1826,7 @@ async function enrichPremarketNewsWithLiveQuotes(newsItems: any[]): Promise<any[
     const t = (item.ticker || '').toUpperCase().trim();
     const live = quotesMap[t];
     if (live && live.source === 'yahoo_finance_live') {
+      const isBear = item.sentiment === 'BEARISH';
       const reactionAnalysis = buildContextualReactionAnalysis({
         ticker: t,
         title: item.rawTitleEn || item.headline,
@@ -1789,11 +1838,21 @@ async function enrichPremarketNewsWithLiveQuotes(newsItems: any[]): Promise<any[
         aiOverride: item._aiCacheKey ? dailyAiNewsCache.get(item._aiCacheKey) : undefined,
       });
 
+      const updatedTarget = Number((live.price * (t === 'SPY' ? (isBear ? 1.03 : 1.09) : isBear ? 1.06 : 1.18)).toFixed(2));
+      const updatedBuyMax = Number((live.price * (t === 'SPY' ? (isBear ? 0.96 : 1.0) : isBear ? 0.94 : 1.02)).toFixed(2));
+
       return {
         ...item,
         reactionAnalysis,
         preMarketPrice: live.price,
         preMarketChangePercent: live.changePercent,
+        recommendation: item.recommendation
+          ? {
+              ...item.recommendation,
+              targetPrice: updatedTarget,
+              buyZoneMax: updatedBuyMax,
+            }
+          : item.recommendation,
       };
     }
     return item;
@@ -4298,6 +4357,7 @@ async function fetchSecRealFinancialSnapshot(ticker: string): Promise<SecRealFin
     const revCandidateTags = [
       'RevenuesNetOfInterestExpense',
       'Revenues',
+      'RegulatedAndUnregulatedOperatingRevenue',
       'TotalRevenuesAndOtherIncome',
       'SalesRevenueNet',
       'RevenueFromContractWithCustomerExcludingAssessedTax',
@@ -4537,8 +4597,24 @@ function generateFallbackStockAudit(
     sec?.entityName ||
     `${ticker} Corporation`;
 
+  const mapSicToGicsSector = (sic?: string): string => {
+    const s = (sic || '').toLowerCase();
+    if (!s) return 'Broad Market Quality';
+    if (/(electric|gas distribution|water supply|sanitary|utilities|power generation|combined services|combination utilities)/.test(s)) return 'Utilities';
+    if (/(real estate|reit|land subdividers|operators of nonresidential|apartment building)/.test(s)) return 'Real Estate';
+    if (/(bank|credit|savings|finance|investment|insurance|brokerage|security|mortgage)/.test(s)) return 'Financials';
+    if (/(pharmaceutical|biolog|medicinal|surgical|medical|hospital|health|diagnostic|dental)/.test(s)) return 'Health Care';
+    if (/(petroleum|oil|natural gas|crude|refining|coal|drilling)/.test(s)) return 'Energy';
+    if (/(food|beverage|tobacco|grocery|household|soap|cosmetic|perfume|supermarket)/.test(s)) return 'Consumer Staples';
+    if (/(retail|apparel|restaurant|eating places|hotel|motel|motor vehicle|automotive|furniture|entertainment|amusement)/.test(s)) return 'Consumer Discretionary';
+    if (/(telecommunications|telephone|radio|television|broadcast|cable|publishing|motion picture|communication)/.test(s)) return 'Communication Services';
+    if (/(aerospace|defense|railroad|air transportation|trucking|machinery|construction|industrial|engineering|freight|wholesale-durable)/.test(s)) return 'Industrials';
+    if (/(chemical|steel|metal|mining|paper|forest|plastic|packaging|glass|cement)/.test(s)) return 'Materials';
+    return 'Information Technology';
+  };
+
   const resolvedExchange = sec?.exchange || 'NASDAQ';
-  const resolvedSector = known?.sector || (sec?.sicDescription ? 'Information Technology / Corporate' : 'Broad Market Quality');
+  const resolvedSector = known?.sector || mapSicToGicsSector(sec?.sicDescription);
   const resolvedIndustry = known?.industry || sec?.sicDescription || 'Publicly Traded Equity';
 
   // Prefer official live exchange Market Cap from Nasdaq API (accurate for ADRs & multi-class shares), then SEC shares * live price
@@ -5298,6 +5374,7 @@ async function fetchSecQuarterlyReports(rawTicker: string) {
   const revSeries = extractStandaloneQuarterPoints(factsJson, [
     'RevenuesNetOfInterestExpense',
     'Revenues',
+    'RegulatedAndUnregulatedOperatingRevenue',
     'TotalRevenuesAndOtherIncome',
     'SalesRevenueNet',
     'RevenueFromContractWithCustomerExcludingAssessedTax',

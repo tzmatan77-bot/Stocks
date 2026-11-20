@@ -390,8 +390,19 @@ export const DailyMarketRecommendationsCard: React.FC<DailyMarketRecommendationP
                     <div className="flex items-center gap-2.5 min-w-0">
                       <StockLogoBadge ticker={item.ticker} size="sm" />
                       <div className="min-w-0">
-                        <span className="font-bold text-white text-sm font-mono block">{item.ticker}</span>
-                        <span className="text-[11px] text-slate-400 block truncate">{item.companyName}</span>
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-bold text-white text-sm font-mono">{item.ticker}</span>
+                          {item.ticker === 'SPY' && (
+                            <span className="text-[10px] font-medium text-cyan-300">
+                              {isHe ? 'מאקרו · מדד S&P 500' : 'Macro · S&P 500'}
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-[11px] text-slate-400 block truncate">
+                          {item.ticker === 'SPY'
+                            ? isHe ? 'תעודת סל SPY (חדשות שוק כלליות)' : 'SPDR S&P 500 ETF (Macro News)'
+                            : item.companyName}
+                        </span>
                       </div>
                     </div>
 
